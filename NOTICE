@@ -1,0 +1,16 @@
+书中有音 (Shuzhong Youyin)
+=======================
+
+本项目使用了 Ting Reader 开源项目（https://github.com/dqsq2e2/ting-reader，
+AGPL-3.0，源码基线 v2.0.6）的扫描/解析实现，由「乌云总会散」完成 fnOS 适配、
+扫描与分章增强、背景音乐能力以及打包维护。感谢 Ting Reader 原作者与所有开源贡献者。
+
+依据 AGPL-3.0：
+- 本衍生作品继续以 AGPL-3.0 分发；
+- 上游原始许可与免责声明原文完整保留在安装目录：
+  fnOS 安装包为 server/thirdparty/ting-reader-LICENSE.txt 与
+  ting-reader-LICENSE.en.txt；Docker 镜像与源码仓库为 thirdparty/ 同名文件；
+- 接收者有权获取对应的完整源代码，可通过上述上游项目地址获取上游基线代码。
+
+安装向导与界面展示的《使用许可与免责声明》为「书中有音」自身条款，
+见包内 LICENSE 与 LICENSE.en。

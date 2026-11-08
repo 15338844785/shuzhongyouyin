@@ -1,0 +1,17 @@
+services:
+  shuzhongyouyin:
+    image: ghcr.io/15338844785/shuzhongyouyin:1.6.2
+    container_name: shuzhongyouyin
+    restart: unless-stopped
+    ports:
+      - "8098:8098"
+    environment:
+      - TZ=Asia/Shanghai
+      - FNPATH_DATA_DIR=/data
+    volumes:
+      # 数据目录：设置、账号、封面、BGM、刮削源、播放进度都在这里，必须持久化
+      - ./data:/data
+      # 有声书库目录（按你的实际路径改），容器内路径可自定义，建议只读
+      - /vol1/1000/有声书:/media/books:ro
+      # 可选：把已有音乐目录挂进来，在网页「设置-背景音乐」里选择该目录
+      - /vol1/1000/音乐:/media/bgm

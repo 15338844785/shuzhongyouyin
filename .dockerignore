@@ -1,0 +1,13 @@
+.git
+.gitignore
+.github
+data
+__pycache__
+*.pyc
+*.pyo
+*.bak
+*.bak-*
+.DS_Store
+Thumbs.db
+*.log
+scratch
