@@ -1179,6 +1179,9 @@ body.on-player .mini { display: none; }
 .asr-state-pill.installing,
 .asr-state-pill.queued { color: var(--hl-char); border-color: var(--hl-char); background: var(--hl-soft-bg); }
 .asr-state-pill.failed { color: var(--danger); border-color: var(--danger); }
+.asr-state-pill.stopped { color: #b45309; border-color: #b45309; background: rgba(180, 83, 9, .1); }
+.asr-state-pill.missing,
+.asr-state-pill.unreachable { color: var(--danger); border-color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); }
 .asr-status-line { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 4px 0 14px; }
 .asr-status-line .hint { font-size: 12px; }
 .asr-arch { font-size: 12px; font-weight: 600; padding: 4px 9px; border-radius: 8px; white-space: nowrap; }

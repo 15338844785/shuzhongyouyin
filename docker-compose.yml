@@ -1,6 +1,6 @@
 services:
   shuzhongyouyin:
-    image: ghcr.io/15338844785/shuzhongyouyin:1.6.2
+    image: ghcr.io/15338844785/shuzhongyouyin:1.7.0
     container_name: shuzhongyouyin
     restart: unless-stopped
     ports:

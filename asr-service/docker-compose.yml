@@ -1,0 +1,32 @@
+services:
+  asr:
+    image: ghcr.io/15338844785/shuzhongyouyin-asr:1.0.0
+    container_name: shuzhongyouyin-asr
+    restart: unless-stopped
+    ports:
+      - "8099:8099"
+    environment:
+      # 访问口令；留空会在容器内自动生成并写入 /data/token.txt（不打印到日志）
+      # 查看：docker compose exec asr cat /data/token.txt
+      SY_ASR_TOKEN: ""
+      # 媒体库根目录，必须与书中有音里的书库路径一致；多个用英文冒号分隔
+      SY_MEDIA_ROOTS: "/vol2/1000/有声书"
+      SY_ASR_MODEL: "medium"
+      SY_ASR_THREADS: "4"
+      SY_ASR_NICE: "10"
+      SY_ASR_IONICE_CLASS: "2"
+      SY_ASR_IONICE_DATA: "7"
+      # 媒体目录只读时，字幕回退到书中有音的 @appdata 目录
+      SY_FALLBACK_SUBTITLES: "/fallback/subtitles"
+    volumes:
+      # 左侧换成你的真实书库路径；必须挂载到容器内相同路径
+      - "/vol2/1000/有声书:/vol2/1000/有声书"
+      # 书中有音的应用数据目录（含 subtitles/<book_id>/），用于只读回退
+      - "/vol1/@appdata/shuzhongyouyin:/fallback"
+      # 模型与任务库持久化，避免重建容器重复下载 1.5 GB 模型
+      - "asr-data:/data"
+    mem_limit: 4g
+    cpus: "4"
+
+volumes:
+  asr-data:

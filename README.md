@@ -16,6 +16,27 @@
 - 播放进度、收藏、播放列表、倍速、定时关闭
 - 账号体系：管理员/普通用户、多用户独立进度、头像
 - 多端访问：桌面浏览器、手机浏览器，局域网直连即可
+- 字幕：读取音频同目录的 `.srt` / `.lrc` / `.vtt`；批量转写由独立 Docker 服务完成
+
+## 字幕转写（独立服务）
+
+从 1.7.0 起，书中有音本体**只负责播放与字幕显示**，不再内置 Whisper 模型、venv 与转写进程。
+批量把音频转成字幕由配套的 Docker 应用 [`asr-service`](asr-service/) 完成：
+
+- 浏览媒体库、搜索书名/章节，按书或按章节范围批量建任务
+- 单并发队列（一次一章、4 线程、`nice 10`、`ionice 7`），SQLite 持久化，可暂停、失败重试
+- 字幕写到音频同目录；媒体目录只读时回退到 `@appdata/shuzhongyouyin/subtitles/<book_id>/`
+- 访问口令由环境变量 `SY_ASR_TOKEN` 设置，公网部署不会裸奔；FPK 部署时随机生成并保存在
+  `@appdata/shuzhongyouyin/asr-token.txt`（仅 root 可读，面板只显示「已配置/未配置」，不回显明文、不写日志）
+
+FPK 安装/升级时会检查 `docker`/`dockerd` 并自动部署容器 `shuzhongyouyin-asr`（端口 `8099`，
+`--restart unless-stopped`、`mem_limit 4g`）。**本机没有可用的 Docker 时，安装会直接中止**并提示先安装
+Docker，不会装成半残状态。手动部署见 [`asr-service/docker-compose.yml`](asr-service/docker-compose.yml)。
+
+镜像发布在 `ghcr.io/15338844785/shuzhongyouyin-asr:1.0.0`（`:latest` 同源）。首次启动会拉取约 **1.03 GB**
+镜像，模型（medium 约 1.5 GB）在第一次转写时下载。
+
+装好后在书中有音「我的 → 转写服务」里可以看到服务状态、修改服务地址，并点「选择要转换的书籍」跳到转写页面。
 
 ## 三种安装方式
 
@@ -30,7 +51,7 @@ docker run -d \
   -e FNPATH_DATA_DIR=/data \
   -v /volume1/docker/shuzhongyouyin/data:/data \
   -v /volume1/有声书:/media/books:ro \
-  ghcr.io/15338844785/shuzhongyouyin:1.6.2
+  ghcr.io/15338844785/shuzhongyouyin:1.7.0
 ```
 
 ### 2. docker-compose

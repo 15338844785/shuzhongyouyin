@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>书中有音 · 转写服务</title>
+<style>
+:root{
+  --bg:#f5f3ee;--panel:#fffdf9;--ink:#24211c;--muted:#7c7468;--line:#e6e0d5;
+  --line-strong:#d6cdbd;--accent:#8a5a2b;--accent-soft:#f2e7da;--ok:#2f7d4f;
+  --warn:#a8621b;--bad:#b03a2e;--radius:14px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+button,input,textarea{font:inherit;color:inherit}
+a{color:var(--accent)}
+.wrap{max-width:1080px;margin:0 auto;padding:22px 18px 80px}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+.mark{width:38px;height:38px;border-radius:11px;background:var(--accent);color:#fff;
+  display:flex;align-items:center;justify-content:center;font-weight:700;font-size:19px}
+h1{font-size:19px;margin:0}
+.sub{color:var(--muted);font-size:12.5px}
+.grow{flex:1}
+.tabs{display:flex;gap:6px;background:#efeae1;border-radius:11px;padding:4px}
+.tabs button{border:0;background:transparent;padding:7px 16px;border-radius:8px;cursor:pointer;color:var(--muted)}
+.tabs button.on{background:var(--panel);color:var(--ink);box-shadow:0 1px 4px rgba(0,0,0,.06);font-weight:600}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;margin-bottom:14px}
+.hint{color:var(--muted);font-size:12.5px}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.btn{border:1px solid var(--line-strong);background:#fff;height:36px;padding:0 14px;border-radius:9px;cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.btn.small{height:30px;padding:0 10px;font-size:13px}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+input[type=search],input[type=text],input[type=password],textarea{
+  border:1px solid var(--line-strong);border-radius:9px;background:#fff;padding:8px 11px;outline:none;width:100%}
+input:focus,textarea:focus{border-color:var(--accent)}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);
+  border:1px solid var(--line);border-radius:20px;padding:4px 11px;background:#fff}
+.dot{width:7px;height:7px;border-radius:50%;background:#bbb}
+.dot.on{background:var(--ok)}.dot.pause{background:var(--warn)}
+.book{border:1px solid var(--line);border-radius:12px;margin-bottom:10px;overflow:hidden;background:#fff}
+.book-head{display:flex;align-items:center;gap:10px;padding:11px 13px;cursor:pointer}
+.book-head:hover{background:#faf7f0}
+.book-title{font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{font-size:11.5px;color:var(--muted);background:#f1ede5;border-radius:20px;padding:2px 9px}
+.chapters{display:none;border-top:1px solid var(--line);padding:8px 13px 12px;max-height:340px;overflow:auto}
+.book.open .chapters{display:block}
+.ch{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13.5px}
+.ch label{display:flex;align-items:center;gap:7px;flex:1;min-width:0;cursor:pointer}
+.ch .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ch .sub-mark{font-size:11px;color:var(--ok);flex:none}
+.range{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--muted);padding:6px 0 8px;border-bottom:1px dashed var(--line);margin-bottom:6px}
+.range input{width:74px;padding:4px 8px;border:1px solid var(--line-strong);border-radius:7px}
+.batchbar{position:sticky;bottom:14px;display:flex;align-items:center;gap:12px;
+  background:#2b2620;color:#fff;border-radius:13px;padding:11px 15px;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+.batchbar .count{font-weight:600}
+.batchbar .btn{background:#fff;border-color:#fff;color:#2b2620}
+.task{border:1px solid var(--line);border-radius:11px;padding:11px 13px;margin-bottom:9px;background:#fff}
+.task .top{display:flex;align-items:center;gap:10px}
+.task .name{font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task .state{font-size:12px;border-radius:20px;padding:2px 9px;background:#f1ede5;color:var(--muted);flex:none}
+.task .state.running{background:#e7f3ec;color:var(--ok)}
+.task .state.failed{background:#fae9e7;color:var(--bad)}
+.task .state.done{background:#eef2e9;color:#4f6b3a}
+.bar{height:5px;background:#eee8dd;border-radius:4px;overflow:hidden;margin-top:9px}
+.bar span{display:block;height:100%;background:var(--accent);width:0}
+.task .meta{display:flex;justify-content:space-between;color:var(--muted);font-size:12px;margin-top:6px;gap:10px}
+.task .err{color:var(--bad);font-size:12px;margin-top:6px;word-break:break-all}
+.cards{display:grid;grid-template-columns:repeat(5,1fr);gap:9px;margin-bottom:13px}
+.card{background:#fff;border:1px solid var(--line);border-radius:11px;padding:11px}
+.card b{display:block;font-size:20px}
+.card span{color:var(--muted);font-size:12px}
+.empty{color:var(--muted);text-align:center;padding:34px 0;font-size:13.5px}
+#login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:20;padding:20px}
+#login .card{max-width:360px;width:100%;padding:26px;text-align:center}
+#login h2{margin:10px 0 4px;font-size:18px}
+#login input{margin:14px 0 10px}
+#login .hint{margin-bottom:14px}
+.hidden{display:none!important}
+.callback{display:inline-flex;align-items:center;gap:6px;color:var(--accent);text-decoration:none;font-weight:600;font-size:13.5px}
+@media(max-width:640px){.cards{grid-template-columns:repeat(2,1fr)}.wrap{padding:16px 12px 90px}}
+</style>
+</head>
+<body>
+<div id="login" class="hidden">
+  <div class="card panel">
+    <div class="mark" style="margin:0 auto">书</div>
+    <h2>转写服务</h2>
+    <div class="hint">输入访问口令后使用。口令由部署时设置（环境变量 SY_ASR_TOKEN）。</div>
+    <input id="login-token" type="password" placeholder="访问口令" autocomplete="current-password">
+    <button id="login-go" class="btn primary" style="width:100%;height:38px">进入</button>
+    <div id="login-error" class="hint" style="color:var(--bad);margin-top:10px"></div>
+  </div>
+</div>
+
+<div class="wrap">
+  <header>
+    <div class="mark">书</div>
+    <div>
+      <h1>书中有音 · 转写服务</h1>
+      <div class="sub">批量把有声书章节转成字幕，写完书中有音直接可读</div>
+    </div>
+    <div class="grow"></div>
+    <div class="status"><span class="dot" id="status-dot"></span><span id="status-text">连接中…</span></div>
+    <a id="callback-link" class="callback hidden" href="#">返回书中有音 →</a>
+  </header>
+
+  <div class="row" style="margin-bottom:14px">
+    <div class="tabs">
+      <button data-tab="library" class="on">书库</button>
+      <button data-tab="tasks">任务</button>
+      <button data-tab="settings">设置</button>
+    </div>
+    <div class="grow"></div>
+    <button id="logout" class="btn small">退出</button>
+  </div>
+
+  <section id="tab-library">
+    <div class="panel">
+      <div class="row">
+        <div style="flex:1;min-width:200px"><input id="search" type="search" placeholder="搜索书名或章节…"></div>
+        <button id="refresh-lib" class="btn">刷新目录</button>
+      </div>
+      <div class="hint" style="margin-top:8px" id="lib-summary">正在读取媒体库…</div>
+    </div>
+    <div id="books"></div>
+    <div id="batch" class="batchbar hidden">
+      <span class="count" id="batch-count">0 章</span>
+      <span class="hint" style="color:#cfc6b8;flex:1">已有字幕的章节会自动跳过</span>
+      <button id="create-tasks" class="btn primary">开始转换</button>
+    </div>
+  </section>
+
+  <section id="tab-tasks" class="hidden">
+    <div class="cards">
+      <div class="card"><b id="c-running">0</b><span>进行中</span></div>
+      <div class="card"><b id="c-queued">0</b><span>排队</span></div>
+      <div class="card"><b id="c-done">0</b><span>已完成</span></div>
+      <div class="card"><b id="c-failed">0</b><span>失败</span></div>
+      <div class="card"><b id="c-total">0</b><span>全部</span></div>
+    </div>
+    <div class="panel row">
+      <button id="toggle-queue" class="btn">暂停队列</button>
+      <span class="hint" id="queue-hint">一次只转一章，4 线程，低优先级运行</span>
+      <div class="grow"></div>
+      <button id="refresh-tasks" class="btn small">刷新</button>
+    </div>
+    <div id="tasks"></div>
+  </section>
+
+  <section id="tab-settings" class="hidden">
+    <div class="panel">
+      <h3 style="margin:0 0 6px;font-size:15px">媒体库根目录</h3>
+      <div class="hint" style="margin-bottom:10px">必须是书中有音里配置的书库绝对路径（容器内挂载到相同路径），每行一个。修改后任务里记录的书的 ID 才能与书中有音对齐。</div>
+      <textarea id="roots" rows="4" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:10px">
+        <button id="save-roots" class="btn primary small">保存目录</button>
+        <span class="hint" id="roots-hint"></span>
+      </div>
+    </div>
+    <div class="panel">
+      <h3 style="margin:0 0 8px;font-size:15px">运行信息</h3>
+      <div class="hint" id="runtime"></div>
+    </div>
+  </section>
+</div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+let books = [];
+let selected = new Set();
+let tab = 'library';
+let tasksTimer = null;
+let callback = new URLSearchParams(location.search).get('callback') || '';
+if (callback) {
+  const link = $('callback-link');
+  link.href = callback;
+  link.classList.remove('hidden');
+}
+
+function esc(t){return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function toast(msg){console.log(msg);}
+
+async function api(path, options) {
+  const opts = Object.assign({headers:{}}, options || {});
+  if (opts.body && !opts.headers['Content-Type']) opts.headers['Content-Type']='application/json';
+  const resp = await fetch(path, opts);
+  let data = {};
+  try { data = await resp.json(); } catch(e) {}
+  if (resp.status === 401) { showLogin(); throw new Error('未授权'); }
+  if (!resp.ok || data.ok === false) throw new Error(data.error || ('HTTP ' + resp.status));
+  return data;
+}
+
+function showLogin(){
+  $('login').classList.remove('hidden');
+  $('login-token').focus();
+}
+function hideLogin(){ $('login').classList.add('hidden'); }
+
+async function login(){
+  const token = $('login-token').value.trim();
+  if (!token) return;
+  try {
+    await api('/api/login', {method:'POST', body: JSON.stringify({token})});
+    localStorage.setItem('sy_asr_token', token);
+    hideLogin();
+    $('login-error').textContent = '';
+    boot();
+  } catch (err) {
+    $('login-error').textContent = err.message || '口令不正确';
+  }
+}
+
+function setTab(name){
+  tab = name;
+  document.querySelectorAll('.tabs button').forEach((b)=>b.classList.toggle('on', b.dataset.tab===name));
+  ['library','tasks','settings'].forEach((key)=>$('tab-'+key).classList.toggle('hidden', key!==name));
+  if (name==='library') loadLibrary();
+  if (name==='tasks') { loadTasks(); startTasksPoll(); } else { stopTasksPoll(); }
+  if (name==='settings') loadState();
+}
+
+async function loadState(){
+  try {
+    const data = await api('/api/state');
+    $('status-dot').className = 'dot ' + (data.paused ? 'pause' : 'on');
+    $('status-text').textContent = data.paused ? '队列已暂停' : '服务正常';
+    $('roots').value = (data.roots || []).join('\n');
+    $('runtime').innerHTML = '版本 ' + esc(data.version) + ' · 模型 ' + esc(data.model) +
+      ' · 线程 ' + esc(data.threads) + '<br>回退字幕目录：' + esc(data.fallback);
+    $('toggle-queue').textContent = data.paused ? '继续队列' : '暂停队列';
+    $('queue-hint').textContent = data.paused ? '已暂停，当前任务仍会跑完' : '一次只转一章，4 线程，低优先级运行';
+    updateCounts(data.counts || {});
+  } catch (err) {
+    $('status-dot').className = 'dot';
+    $('status-text').textContent = '连接失败';
+  }
+}
+
+function updateCounts(c){
+  $('c-running').textContent = (c.running||0) + (c.cancelling||0);
+  $('c-queued').textContent = c.queued||0;
+  $('c-done').textContent = c.done||0;
+  $('c-failed').textContent = c.failed||0;
+  $('c-total').textContent = c.total||0;
+}
+
+async function loadLibrary(){
+  const q = $('search').value.trim();
+  $('lib-summary').textContent = '正在读取媒体库…';
+  try {
+    const data = await api('/api/library' + (q ? '?q=' + encodeURIComponent(q) : ''));
+    books = data.books || [];
+    let chapters = 0;
+    books.forEach((b)=>chapters += b.chapters.length);
+    $('lib-summary').textContent = '共 ' + books.length + ' 本 / ' + chapters + ' 章';
+    renderBooks();
+  } catch (err) {
+    $('lib-summary').textContent = err.message || '读取失败';
+  }
+}
+
+function renderBooks(){
+  const box = $('books');
+  if (!books.length) { box.innerHTML = '<div class="empty">没有找到书。检查「设置 → 媒体库根目录」。</div>'; return; }
+  box.innerHTML = books.map((b)=>{
+    const subs = b.chapters.filter((c)=>c.has_subtitle).length;
+    const chapters = b.chapters.map((c)=>{
+      const key = b.book_id + ':' + c.index;
+      const checked = selected.has(key) ? ' checked' : '';
+      const mark = c.has_subtitle ? '<span class="sub-mark">已有字幕</span>' : '';
+      return '<div class="ch"><label><input type="checkbox" data-key="' + key + '"' + checked + '>' +
+        '<span class="name">' + esc(c.title) + '</span></label>' + mark + '</div>';
+    }).join('');
+    return '<div class="book" data-book="' + b.book_id + '">' +
+      '<div class="book-head"><input type="checkbox" data-book-check="' + b.book_id + '">' +
+      '<span class="book-title">' + esc(b.title) + '</span>' +
+      '<span class="badge">' + b.chapters.length + ' 章</span>' +
+      (subs ? '<span class="badge">字幕 ' + subs + '</span>' : '') +
+      '<span class="hint">展开</span></div>' +
+      '<div class="chapters">' +
+      '<div class="range">按范围：第 <input type="number" min="1" data-from="' + b.book_id + '" value="1"> 至 ' +
+      '<input type="number" min="1" data-to="' + b.book_id + '" value="' + b.chapters.length + '"> 章 ' +
+      '<button class="btn small" data-range-add="' + b.book_id + '">勾选范围</button></div>' +
+      chapters + '</div></div>';
+  }).join('');
+  updateBatch();
+}
+
+function updateBatch(){
+  const n = selected.size;
+  $('batch').classList.toggle('hidden', n === 0);
+  $('batch-count').textContent = n + ' 章';
+}
+
+async function createTasks(){
+  const byBook = {};
+  selected.forEach((key)=>{
+    const [bookId, idx] = key.split(':');
+    (byBook[bookId] = byBook[bookId] || []).push(Number(idx));
+  });
+  const items = Object.keys(byBook).map((bookId)=>{
+    const list = byBook[bookId].sort((a,b)=>a-b);
+    // 连续章节合并成一个范围，任务更少
+    const ranges = [];
+    let start = list[0], prev = list[0];
+    for (let i = 1; i <= list.length; i += 1) {
+      if (i === list.length || list[i] !== prev + 1) {
+        ranges.push({book_id: bookId, from: start, to: prev});
+        start = list[i];
+      }
+      prev = list[i];
+    }
+    return ranges;
+  }).reduce((acc, list)=>acc.concat(list), []);
+  if (!items.length) return;
+  $('create-tasks').disabled = true;
+  try {
+    const data = await api('/api/tasks', {method:'POST', body: JSON.stringify({items})});
+    selected.clear();
+    renderBooks();
+    toast('已创建 ' + data.result.created + ' 个任务，跳过 ' + data.result.skipped);
+    setTab('tasks');
+  } catch (err) {
+    alert(err.message || '创建任务失败');
+  } finally {
+    $('create-tasks').disabled = false;
+  }
+}
+
+async function loadTasks(){
+  try {
+    const data = await api('/api/tasks');
+    updateCounts(data.counts || {});
+    $('toggle-queue').textContent = data.paused ? '继续队列' : '暂停队列';
+    $('queue-hint').textContent = data.paused ? '已暂停，当前任务仍会跑完' : '一次只转一章，4 线程，低优先级运行';
+    $('status-dot').className = 'dot ' + (data.paused ? 'pause' : 'on');
+    $('status-text').textContent = data.paused ? '队列已暂停' : '服务正常';
+    renderTasks(data.tasks || []);
+  } catch (err) {
+    $('tasks').innerHTML = '<div class="empty">' + esc(err.message || '读取失败') + '</div>';
+  }
+}
+
+function renderTasks(tasks){
+  const box = $('tasks');
+  if (!tasks.length) { box.innerHTML = '<div class="empty">还没有任务，去「书库」勾选章节开始转换。</div>'; return; }
+  const stateText = {queued:'排队', running:'转写中', cancelling:'取消中', done:'已完成', failed:'失败', cancelled:'已取消'};
+  box.innerHTML = tasks.map((t)=>{
+    const actions = [];
+    if (t.state === 'failed' || t.state === 'cancelled') actions.push('<button class="btn small" data-retry="' + t.id + '">重试</button>');
+    if (['queued','running','cancelling'].indexOf(t.state) >= 0) actions.push('<button class="btn small" data-cancel="' + t.id + '">取消</button>');
+    const meta = t.state === 'running'
+      ? (t.percent.toFixed(1) + '% · ' + t.cues + ' 句' + (t.duration ? ' · ' + Math.round(t.duration) + ' 秒音频' : ''))
+      : (t.state === 'done' ? ('完成 · ' + t.cues + ' 句') : ('第 ' + (t.tries||0) + ' 次尝试'));
+    return '<div class="task"><div class="top"><span class="name">' + esc(t.book_title) + ' · ' + esc(t.chapter_title) + '</span>' +
+      actions.join(' ') + '<span class="state ' + t.state + '">' + (stateText[t.state] || t.state) + '</span></div>' +
+      '<div class="bar"><span style="width:' + (t.state === 'done' ? 100 : t.percent) + '%"></span></div>' +
+      '<div class="meta"><span>' + esc(meta) + '</span><span>' + esc(t.audio_path) + '</span></div>' +
+      (t.error ? '<div class="err">' + esc(t.error) + '</div>' : '') + '</div>';
+  }).join('');
+}
+
+function startTasksPoll(){ stopTasksPoll(); tasksTimer = setInterval(loadTasks, 2500); }
+function stopTasksPoll(){ if (tasksTimer) { clearInterval(tasksTimer); tasksTimer = null; } }
+
+async function toggleQueue(){
+  const paused = $('toggle-queue').textContent.indexOf('继续') < 0;
+  try {
+    await api('/api/queue', {method:'POST', body: JSON.stringify({paused})});
+    loadTasks();
+  } catch (err) { alert(err.message); }
+}
+
+async function saveRoots(){
+  const roots = $('roots').value.split('\n').map((s)=>s.trim()).filter(Boolean);
+  try {
+    const data = await api('/api/roots', {method:'POST', body: JSON.stringify({roots})});
+    $('roots-hint').textContent = '已保存 ' + data.roots.length + ' 个目录';
+    loadLibrary();
+  } catch (err) { $('roots-hint').textContent = err.message; }
+}
+
+document.addEventListener('click', (event)=>{
+  const target = event.target;
+  const bookHead = target.closest('.book-head');
+  if (bookHead && target.tagName !== 'INPUT') bookHead.parentElement.classList.toggle('open');
+  if (target.dataset && target.dataset.retry) {
+    api('/api/tasks/' + target.dataset.retry + '/retry', {method:'POST'}).then(loadTasks).catch((e)=>alert(e.message));
+  }
+  if (target.dataset && target.dataset.cancel) {
+    api('/api/tasks/' + target.dataset.cancel + '/cancel', {method:'POST'}).then(loadTasks).catch((e)=>alert(e.message));
+  }
+  if (target.dataset && target.dataset.rangeAdd) {
+    const bookId = target.dataset.rangeAdd;
+    const book = books.find((b)=>b.book_id === bookId);
+    const from = Math.max(1, Number(document.querySelector('[data-from="' + bookId + '"]').value) || 1);
+    const to = Math.min(book.chapters.length, Number(document.querySelector('[data-to="' + bookId + '"]').value) || book.chapters.length);
+    book.chapters.forEach((c)=>{ if (c.index >= from - 1 && c.index <= to - 1) selected.add(bookId + ':' + c.index); });
+    renderBooks();
+  }
+  if (target.dataset && target.dataset.tab) setTab(target.dataset.tab);
+});
+
+document.addEventListener('change', (event)=>{
+  const target = event.target;
+  if (target.dataset && target.dataset.key) {
+    if (target.checked) selected.add(target.dataset.key); else selected.delete(target.dataset.key);
+    updateBatch();
+  }
+  if (target.dataset && target.dataset.bookCheck) {
+    const bookId = target.dataset.bookCheck;
+    const book = books.find((b)=>b.book_id === bookId);
+    if (!book) return;
+    book.chapters.forEach((c)=>{
+      const key = bookId + ':' + c.index;
+      if (target.checked) selected.add(key); else selected.delete(key);
+    });
+    renderBooks();
+  }
+});
+
+$('search').addEventListener('input', ()=>{ clearTimeout(window._searchTimer); window._searchTimer = setTimeout(loadLibrary, 260); });
+$('refresh-lib').addEventListener('click', ()=>api('/api/library?refresh=1').then((data)=>{ books = data.books || []; renderBooks(); }).catch((e)=>alert(e.message)));
+$('create-tasks').addEventListener('click', createTasks);
+$('refresh-tasks').addEventListener('click', loadTasks);
+$('toggle-queue').addEventListener('click', toggleQueue);
+$('save-roots').addEventListener('click', saveRoots);
+$('login-go').addEventListener('click', login);
+$('login-token').addEventListener('keydown', (e)=>{ if (e.key === 'Enter') login(); });
+$('logout').addEventListener('click', ()=>api('/api/logout', {method:'POST'}).then(()=>{ localStorage.removeItem('sy_asr_token'); showLogin(); }));
+
+async function boot(){
+  try {
+    await api('/api/state');
+    hideLogin();
+    setTab('library');
+  } catch (err) {
+    if (err.message !== '未授权') {
+      $('status-text').textContent = '连接失败';
+      $('lib-summary').textContent = err.message;
+    }
+  }
+}
+
+(async function start(){
+  try {
+    const health = await fetch('/api/health').then((r)=>r.json());
+    $('status-dot').className = 'dot ' + (health.paused ? 'pause' : 'on');
+    $('status-text').textContent = health.paused ? '队列已暂停' : '服务正常';
+  } catch (e) {}
+  await boot();
+})();
+</script>
+</body>
+</html>

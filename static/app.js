@@ -65,16 +65,8 @@ const state = {
   dirRoles: [],
   scanReport: { scanned: [], skipped: [], duplicates: 0 },
   subtitle: { key: '', status: 'idle', format: '', encoding: '', segments: [], error: '' },
-  asr: { key: '', state: 'none', cues: 0, percent: 0, error: '', duration: 0, first: 0, model: '' },
-  asrTimer: null,
-  engine: {
-    state: 'missing', installed: false, model: 'medium', model_ready: false, models: [],
-    arch: '', arch_recommended: true, arch_note: '', disk_bytes: 0,
-    percent: 0, step: '', message: '', error: '', error_kind: '', checks: [],
-    log_tail: '', elapsed: 0, checksLoaded: false,
-  },
-  engineTimer: null,
-  engineWaitTimer: null,
+  asrService: { url: '', state: 'unreachable', detail: '', container: '', port: 8099 },
+  asrToken: { configured: false },
   txt: { key: '', status: 'idle', match: '', textTitle: '', paragraphs: [], missingBody: false, note: '', error: '' },
   textOn: localStorage.getItem('sy_text') !== '0',
   textSize: parseFloat(localStorage.getItem('sy_text_size') || '15') || 15,
@@ -462,7 +454,7 @@ function render() {
     case 'playlists': view.innerHTML = viewPlaylists(); break;
     case 'playlist': view.innerHTML = viewPlaylistDetail(r.arg); break;
     case 'book': renderBook(r.arg); return;
-    case 'player': view.innerHTML = viewPlayer(); syncPlayerUI(); ensureSubtitle(); startAsr(); return;
+    case 'player': view.innerHTML = viewPlayer(); syncPlayerUI(); ensureSubtitle(); return;
     case 'mine': view.innerHTML = viewMine(); ensureMineData(); return;
     default: view.innerHTML = viewHome();
   }
@@ -1134,8 +1126,7 @@ function viewPlayer() {
   const chapter = book.chapters[state.chapter] || {};
   const total = (book.chapters || []).length;
   const hasTxt = !!book.has_text;
-  const asrNow = asrOfChapter();
-  const hasText = !!chapter.has_subtitle || hasTxt || asrVisible(asrNow);
+  const hasText = !!chapter.has_subtitle || hasTxt;
   const pal = palette(book.id || book.title || 'book');
   const coverImg = book.cover_url
     ? '<img class="np-cover-art" src="' + esc(appUrl(book.cover_url)) + '" alt="" onerror="this.remove()">' : '';
@@ -1152,7 +1143,7 @@ function viewPlayer() {
           (hasText ?
             '<div class="np-text" id="p-text">' +
               '<div class="np-text-head"><span class="np-text-title">' +
-              (chapter.has_subtitle || (asrNow && asrNow.state !== 'failed') ? '同步文字' : '章节文本') + '</span>' +
+              (chapter.has_subtitle ? '同步文字' : '章节文本') + '</span>' +
               '<span class="np-sub-badge" id="p-sub-badge"></span>' +
               (!chapter.has_subtitle ? '<div class="np-text-tools">' +
                 '<button class="np-tool" data-act="text-size" data-delta="-1" title="缩小字号">A−</button>' +
@@ -1225,319 +1216,118 @@ function emptyTxtState() {
   return { key: '', status: 'none', match: '', textTitle: '', paragraphs: [], missingBody: false, note: '', error: '' };
 }
 
-/* ---------------------------- 按需转写（AI 字幕） ---------------------------- */
+/* ---------------------------- 转写服务（独立 Docker 应用） ---------------------------- */
 
-function asrKeyOf() {
-  return state.current ? (state.current.id + ':' + state.chapter) : '';
+function asrServiceStateText() {
+  const map = { ready: '可连通', stopped: '未运行', missing: '未安装', unreachable: '无法连接' };
+  return map[state.asrService.state] || '未检测';
 }
 
-function asrOfChapter() {
-  if (!state.current) return null;
-  return state.asr && state.asr.key === asrKeyOf() ? state.asr : null;
-}
-
-function asrVisible(a) {
-  return !!a && ['queued', 'running', 'ready', 'failed', 'unavailable'].indexOf(a.state) >= 0;
-}
-
-function applyAsrState(info) {
-  if (!state.asr) return;
-  state.asr.state = info.state || 'queued';
-  state.asr.cues = Number(info.cues || 0);
-  state.asr.percent = Number(info.percent || 0);
-  state.asr.error = info.error || '';
-  state.asr.duration = Number(info.duration || 0);
-  state.asr.first = Number(info.first_cue_elapsed || 0);
-  state.asr.model = info.model || '';
-}
-
-function startAsr() {
-  if (!state.current) return Promise.resolve();
-  const bookId = state.current.id;
-  const idx = state.chapter;
-  const key = bookId + ':' + idx;
-  if (currentChapter().has_subtitle) {
-    if (state.asr.key !== key) state.asr = { key: key, state: 'none', cues: 0, percent: 0, error: '', duration: 0, first: 0, model: '' };
-    return Promise.resolve();
-  }
-  const cur = asrOfChapter();
-  if (cur && ['queued', 'running'].indexOf(cur.state) >= 0) {
-    ensureAsrPoll();
-    return Promise.resolve();
-  }
-  if (cur && cur.state === 'ready' && (state.subtitle.segments || []).length) {
-    return Promise.resolve();
-  }
-  /* 播放即排队：只有正在听的这一章会进队列，没在听的书不会触发 */
-  state.asr = { key: key, state: 'queued', cues: 0, percent: 0, error: '', duration: 0, first: 0, model: '' };
-  ensureAsrPoll();
-  if (route().name === 'player') paintPlayerText();
-  return api('/api/books/' + encodeURIComponent(bookId) + '/asr/' + idx + '/start', {
-    method: 'POST', body: '{}',
-  }).then((data) => {
-    if (state.asr.key !== key) return;
-    applyAsrState(data.asr || {});
-    if (state.asr.state === 'ready') {
-      stopAsrPoll();
-      reloadSubtitle(bookId, idx);
-    } else if (state.asr.state === 'unavailable' || state.asr.state === 'failed') {
-      stopAsrPoll();
-      if (state.asr.state === 'unavailable') waitEngineThenAsr(bookId, idx);
-    }
-    if (route().name === 'player') paintPlayerText();
-  }).catch((err) => {
-    if (state.asr.key !== key) return;
-    state.asr.state = 'failed';
-    state.asr.error = err.message || '转写启动失败';
-    if (route().name === 'player') paintPlayerText();
+function loadAsrService() {
+  return api('/api/asr/service').then((info) => {
+    state.asrService = Object.assign({}, state.asrService, info || {});
+    return state.asrService;
   });
 }
 
-function ensureAsrPoll() {
-  if (state.asrTimer) return;
-  state.asrTimer = setInterval(asrPollTick, 3000);
-}
-
-function stopAsrPoll() {
-  if (state.asrTimer) {
-    clearInterval(state.asrTimer);
-    state.asrTimer = null;
-  }
-}
-
-function asrPollTick() {
-  const a = asrOfChapter();
-  if (!a || route().name !== 'player') return;
-  if (['queued', 'running'].indexOf(a.state) < 0) { stopAsrPoll(); return; }
-  const bookId = state.current.id;
-  const idx = state.chapter;
-  const key = bookId + ':' + idx;
-  api('/api/books/' + encodeURIComponent(bookId) + '/asr/' + idx + '/status').then((data) => {
-    if (!state.current || asrKeyOf() !== key) return;
-    const beforeCues = a.cues || 0;
-    const beforeState = a.state;
-    applyAsrState(data.asr || {});
-    if ((state.asr.cues !== beforeCues || state.asr.state !== beforeState) && route().name === 'player') {
-      paintPlayerText();
-    }
-    /* 字幕中途出现时自动加载，不需要用户刷新 */
-    if (state.asr.cues > 0 || (state.asr.state === 'ready' && beforeState !== 'ready')) {
-      reloadSubtitle(bookId, idx);
-    }
-    if (['ready', 'failed', 'unavailable'].indexOf(state.asr.state) >= 0) stopAsrPoll();
-  }).catch(() => {});
-}
-
-function reloadSubtitle(bookId, idx) {
-  const key = bookId + ':' + idx;
-  api('/api/books/' + encodeURIComponent(bookId) + '/chapters/' + idx + '/subtitle').then((data) => {
-    if (!state.current || asrKeyOf() !== key) return;
-    if (!data.segments || !data.segments.length) return;
-    const same = state.subtitle.key === key && state.subtitle.segments.length === data.segments.length;
-    state.subtitle = {
-      key: key, status: 'ready', format: data.format || 'srt',
-      encoding: data.encoding || '', segments: data.segments, error: '',
-    };
-    if (route().name === 'player' && !same) { paintPlayerText(); syncPlayerText(); }
-  }).catch(() => {});
-}
-
-function stopAsrPrefetch() {
-  if (!state.current) return;
-  api('/api/books/' + encodeURIComponent(state.current.id) + '/asr/stop', {
-    method: 'POST', body: JSON.stringify({ keep_current: true }),
-  }).catch(() => {});
-}
-
-/* ---------------------------- 本地转写引擎（设置页安装 / 状态） ---------------------------- */
-
-function applyEngine(info) {
-  if (!info) return;
-  state.engine = Object.assign({}, state.engine, info);
-  if (info.checks && info.checks.length) state.engine.checksLoaded = true;
-}
-
-function loadEngine() {
-  return api('/api/asr/engine').then((info) => {
-    applyEngine(info || {});
-    return state.engine;
-  });
-}
-
-function loadEngineChecks(force) {
-  return api('/api/asr/engine/precheck' + (force ? '?force=1' : ''))
-    .then((data) => {
-      state.engine.checks = data.checks || [];
-      state.engine.checksLoaded = true;
-      return state.engine.checks;
-    });
-}
-
-function engineBusy() {
-  return ['queued', 'installing'].indexOf(state.engine.state) >= 0;
-}
-
-function ensureEnginePoll() {
-  if (state.engineTimer) return;
-  state.engineTimer = setInterval(enginePollTick, 2000);
-}
-
-function stopEnginePoll() {
-  if (state.engineTimer) {
-    clearInterval(state.engineTimer);
-    state.engineTimer = null;
-  }
-}
-
-function enginePollTick() {
-  api('/api/asr/engine').then((info) => {
-    applyEngine(info || {});
-    if (!engineBusy()) stopEnginePoll();
-    if (route().name === 'mine') refreshEnginePanel();
-    if (route().name === 'player' && state.engine.state === 'ready') {
-      paintPlayerText();
-      if (asrOfChapter() && asrOfChapter().state === 'unavailable') startAsr();
-    }
-  }).catch(() => { stopEnginePoll(); });
-}
-
-function startEngineInstall() {
-  state.engine.state = 'queued';
-  state.engine.step = '排队中';
-  state.engine.percent = 0;
-  ensureEnginePoll();
-  refreshEnginePanel();
-  api('/api/asr/engine/install', { method: 'POST', body: '{}' }).then((data) => {
-    applyEngine(data.engine || {});
-    if (engineBusy()) ensureEnginePoll();
-    refreshEnginePanel();
-  }).catch((err) => {
-    state.engine.state = 'failed';
-    state.engine.error = err.message || '安装启动失败';
-    refreshEnginePanel();
-  });
-}
-
-function cancelEngineInstall() {
-  api('/api/asr/engine/cancel', { method: 'POST', body: '{}' }).then((data) => {
-    applyEngine(data.engine || {});
-    stopEnginePoll();
-    refreshEnginePanel();
-    toast('安装已取消');
-  }).catch((err) => toast(err.message || '取消失败'));
-}
-
-function changeEngineModel(model) {
-  if (!model || model === state.engine.model) return;
-  api('/api/asr/engine/model', { method: 'POST', body: JSON.stringify({ model: model }) })
-    .then((data) => {
-      if (data.ok === false) throw new Error(data.error || '切换失败');
-      applyEngine(data.engine || {});
-      if (engineBusy()) ensureEnginePoll();
-      refreshEnginePanel();
-      toast('已切换到 ' + model + ' 模型');
-    }).catch((err) => toast(err.message || '切换失败'));
-}
-
-/* 播放页检测到引擎未安装/安装中时，就绪后自动开始转写，无需用户刷新 */
-function waitEngineThenAsr(bookId, idx) {
-  if (state.engineWaitTimer) return;
-  const key = bookId + ':' + idx;
-  state.engineWaitTimer = setInterval(() => {
-    if (route().name !== 'player' || !state.current || asrKeyOf() !== key) {
-      clearInterval(state.engineWaitTimer);
-      state.engineWaitTimer = null;
-      return;
-    }
-    api('/api/asr/engine').then((info) => {
-      applyEngine(info || {});
-      if (state.engine.state === 'ready') {
-        clearInterval(state.engineWaitTimer);
-        state.engineWaitTimer = null;
-        state.asr = { key: '', state: 'none', cues: 0, percent: 0, error: '', duration: 0, first: 0, model: '' };
-        if (state.current && asrKeyOf() === key && route().name === 'player') startAsr();
-      }
-    }).catch(() => {});
-  }, 5000);
-}
-
-function refreshEnginePanel() {
+function refreshAsrPanel() {
   const box = $('asr-panel-body');
-  if (box) box.innerHTML = enginePanelBody();
+  if (box) box.innerHTML = asrServicePanelBody();
   const nav = $('asr-nav-state');
-  if (nav) nav.textContent = engineStateText();
+  if (nav) nav.textContent = asrServiceStateText();
   const pill = $('asr-head-pill');
   if (pill) {
-    pill.textContent = engineStateText();
-    pill.className = 'asr-state-pill ' + state.engine.state;
+    pill.textContent = asrServiceStateText();
+    pill.className = 'asr-state-pill ' + state.asrService.state;
   }
 }
 
-function engineStateText() {
-  const map = { ready: '就绪', installing: '安装中', queued: '排队中', failed: '失败', missing: '未安装' };
-  return map[state.engine.state] || '未安装';
+function asrServiceOpenUrl() {
+  const base = state.asrService.url || '';
+  if (!base) return '';
+  const back = window.location.origin + APP_BASE + '/';
+  return base + '/?callback=' + encodeURIComponent(back);
 }
 
-function enginePanelBody() {
-  const e = state.engine;
-  const busy = engineBusy();
-  const checks = e.checks || [];
-  const checkRows = checks.length
-    ? '<div class="asr-checks">' + checks.map((c) =>
-      '<div class="asr-check ' + (c.ok ? 'ok' : 'bad') + '">' +
-      '<span class="dot"></span><b>' + esc(c.label) + '</b>' +
-      '<span class="detail">' + esc(c.detail || '') + '</span></div>').join('') + '</div>'
-    : '<div class="hint">点「环境检测」检查 python3 / ffmpeg / 磁盘 / 镜像连通性。</div>';
-  const archRow = '<div class="form-row"><div><div class="label">当前架构</div>' +
-    '<div class="hint">' + esc(e.arch_note || '检测中…') + '</div></div>' +
-    '<span class="asr-arch ' + (e.arch_recommended ? 'ok' : 'warn') + '">' +
-    esc(e.arch || '—') + (e.arch_recommended ? ' · 推荐' : ' · 不推荐') + '</span></div>';
-  const modelRow = '<div class="form-row"><div><div class="label">识别模型</div>' +
-    '<div class="hint">' + ((e.models || []).find((m) => m.id === e.model) || {}).desc +
-    (!busy && e.installed && !e.model_ready ? ' · 新模型尚未下载' : '') + '</div></div>' +
-    '<div class="segmented">' + ['small', 'medium'].map((id) =>
-      '<button class="' + (e.model === id ? 'active' : '') + '" data-act="asr-model" data-model="' + id + '"' +
-      (busy ? ' disabled' : '') + '>' + id + '</button>').join('') + '</div></div>';
-  const diskRow = '<div class="form-row"><div><div class="label">占用磁盘</div>' +
-    '<div class="hint">独立 venv 与模型都放在点号目录，不参与书库扫描</div></div>' +
-    '<span class="badge gray">' + fmtSize(e.disk_bytes || 0) + '</span></div>';
+function openAsrService() {
+  const url = asrServiceOpenUrl();
+  if (!url) { toast('请先填写转写服务地址'); return; }
+  window.open(url, '_blank', 'noopener');
+}
 
-  let statusBlock = '';
-  let actions = '';
-  if (busy) {
-    statusBlock = '<div class="asr-progress"><div class="asr-progress-head"><b>' +
-      esc(e.step || '安装中') + '</b><span>' + Math.round(e.percent || 0) + '%</span></div>' +
-      '<div class="asr-bar"><i style="width:' + Math.min(100, Math.max(0, Number(e.percent || 0))) + '%"></i></div>' +
-      (e.message ? '<div class="hint">' + esc(e.message) + '</div>' : '') +
-      (e.log_tail ? '<details class="asr-log"><summary>安装日志</summary><pre>' + esc(e.log_tail) + '</pre></details>' : '') +
-      '</div>';
-    actions = '<button class="btn btn-ghost btn-sm" data-act="asr-cancel">中断安装</button>';
-  } else if (e.state === 'ready') {
-    statusBlock = '<div class="empty-note asr-ready"><b>引擎已就绪</b>' +
-      '<span>播放无字幕章节时会自动排队转写，边转边写入字幕；已有 .srt/.lrc 的章节不会重复转写。</span></div>';
-    actions = '<button class="btn btn-ghost btn-sm" data-act="asr-recheck">重新检测环境</button>';
-  } else if (e.state === 'failed') {
-    statusBlock = '<div class="empty-note asr-failed"><b>安装失败' +
-      (e.error_kind ? '（' + esc({ network: '网络', disk: '磁盘', permission: '权限', dependency: '缺少依赖' }[e.error_kind] || e.error_kind) + '）' : '') +
-      '</b><span>' + esc(e.error || '未知原因') + '</span></div>' +
-      (e.log_tail ? '<details class="asr-log" open><summary>安装日志</summary><pre>' + esc(e.log_tail) + '</pre></details>' : '');
-    actions = '<button class="btn btn-primary btn-sm" data-act="asr-install">重试安装</button>';
-  } else {
-    statusBlock = '<div class="empty-note"><b>本地转写引擎尚未安装</b>' +
-      '<span>安装后可在播放时按需生成 AI 字幕（第一次每章首句约 30 秒内出现）。</span></div>';
-    actions = '<button class="btn btn-primary btn-sm" data-act="asr-install">一键安装</button>';
+function refreshAsrService(force) {
+  if (force) {
+    const input = $('asr-service-url');
+    if (input) {
+      const value = String(input.value || '').trim();
+      if (value && value !== state.asrService.url) {
+        return api('/api/asr/service', { method: 'POST', body: JSON.stringify({ url: value }) })
+          .then((info) => {
+            state.asrService = Object.assign({}, state.asrService, info || {});
+            refreshAsrPanel();
+            toast('已保存服务地址');
+          })
+          .catch((err) => toast(err.message || '保存失败'));
+      }
+    }
   }
+  return loadAsrService().then(() => {
+    refreshAsrPanel();
+    if (force) toast('状态已刷新');
+  }).catch((err) => toast(err.message || '检测失败'));
+}
 
-  return '<div class="asr-status-line"><span class="asr-state-pill ' + (e.state || 'missing') + '">' +
-    engineStateText() + '</span>' +
-    '<span class="hint">模型 ' + esc(e.model || 'medium') + '</span>' +
-    (e.elapsed ? '<span class="hint">上次耗时 ' + Math.round(Number(e.elapsed) || 0) + ' 秒</span>' : '') +
+function loadAsrToken() {
+  return api('/api/asr/token').then((info) => {
+    state.asrToken.configured = !!(info && info.configured);
+    return state.asrToken;
+  });
+}
+
+function resetAsrToken() {
+  if (!window.confirm('重置后旧口令立即失效，转写服务容器会用新口令重建（正在转写的任务会中断）。继续？')) return;
+  api('/api/asr/token', { method: 'POST', body: JSON.stringify({ reset: true }) })
+    .then((info) => {
+      state.asrToken.configured = true;
+      refreshAsrPanel();
+      toast((info && info.message) || '口令已重置');
+      loadAsrService().then(refreshAsrPanel).catch(() => {});
+    })
+    .catch((err) => toast(err.message || '重置失败'));
+}
+
+function asrServicePanelBody() {
+  const s = state.asrService;
+  const isAdmin = (state.user || {}).role === 'admin';
+  const noteMap = {
+    ready: ['服务已连通', '点下方按钮进入转写服务的书籍选择页，转完回到书中有音即可看到字幕。'],
+    stopped: ['服务未运行', '容器 shuzhongyouyin-asr 存在但未运行，请在应用中心启动 Docker 与转写服务，或重新安装本应用。'],
+    missing: ['尚未安装转写服务', '宿主机上还没有找到转写容器。重新安装书中有音会自动部署；也可以按 README 手动 docker compose 启动。'],
+    unreachable: ['无法连接转写服务', '请确认地址与端口可访问，并检查容器是否已启动。'],
+  };
+  const note = noteMap[s.state] || noteMap.unreachable;
+  return '<div class="asr-status-line"><span class="asr-state-pill ' + (s.state || 'unreachable') + '">' +
+    asrServiceStateText() + '</span>' +
+    (s.detail ? '<span class="hint">' + esc(s.detail) + '</span>' : '') +
     '</div>' +
-    statusBlock + archRow + modelRow + diskRow +
-    '<div class="asr-check-head"><div class="label">依赖预检</div>' +
-    '<button class="btn btn-ghost btn-sm" data-act="asr-recheck">环境检测</button></div>' +
-    checkRows +
-    '<div class="asr-actions">' + actions + '</div>';
+    '<div class="empty-note"><b>' + esc(note[0]) + '</b><span>' + esc(note[1]) + '</span></div>' +
+    '<div class="form-row"><div><div class="label">转写服务地址</div>' +
+    '<div class="hint">默认 http://当前 NAS 地址:8099；容器换端口或地址时在这里修改</div></div>' +
+    '<div style="display:flex;gap:8px"><input id="asr-service-url" class="mono" value="' + esc(s.url || '') +
+    '" placeholder="http://192.168.1.10:8099" style="width:240px;height:34px;border-radius:9px;border:1px solid var(--line-strong);background:var(--bg);color:var(--ink);padding:0 10px">' +
+    '<button class="btn btn-ghost btn-sm" data-act="asr-save-url">保存并检测</button></div></div>' +
+    '<div class="asr-actions">' +
+    '<button class="btn btn-primary btn-sm" data-act="asr-open">选择要转换的书籍</button>' +
+    '<button class="btn btn-ghost btn-sm" data-act="asr-recheck">刷新状态</button>' +
+    '</div>' +
+    '<div class="form-row" style="margin-top:14px"><div><div class="label">访问口令</div>' +
+    '<div class="hint">打开转写服务 8099 时要输入这串口令，保存在应用数据目录的 <span class="mono">asr-token.txt</span>（仅 root 可读，页面不回显明文）</div></div>' +
+    '<div style="display:flex;gap:8px;align-items:center">' +
+    '<span class="asr-state-pill ' + (state.asrToken.configured ? 'ready' : 'missing') + '">' +
+    (state.asrToken.configured ? '已配置' : '未找到口令') + '</span>' +
+    (isAdmin ? '<button class="btn btn-ghost btn-sm" data-act="asr-token-reset">重置口令</button>' : '') +
+    '</div></div>' +
+    '<div class="hint" style="margin-top:10px">「重置口令」会生成新的随机口令并重建容器（正在转写的任务会中断）。自定义固定口令：改 <span class="mono">@appdata/shuzhongyouyin/asr-token.txt</span> 后执行 <span class="mono">docker rm -f shuzhongyouyin-asr</span> 再重启应用；docker compose 部署时对应 compose 里的 <span class="mono">SY_ASR_TOKEN</span>。</div>';
 }
 
 function ensureSubtitle() {
@@ -1545,9 +1335,7 @@ function ensureSubtitle() {
   if (!panel || !state.current) return Promise.resolve();
   const chapter = currentChapter();
   const key = subtitleKeyOf();
-  const asr = asrOfChapter();
-  const asrHas = !!asr && (asr.state === 'ready' || asr.cues > 0);
-  if (chapter.has_subtitle || asrHas) {
+  if (chapter.has_subtitle) {
     state.txt = emptyTxtState();
     if (state.subtitle.key === key && ['ready', 'loading'].indexOf(state.subtitle.status) >= 0) {
       paintPlayerText();
@@ -1613,14 +1401,10 @@ function paintPlayerText() {
   const lines = $('p-lines');
   if (!panel || !lines) return;
   const chapter = currentChapter();
-  const asr = asrOfChapter();
-  const asrState = asr ? asr.state : '';
-  const asrRunning = ['queued', 'running'].indexOf(asrState) >= 0;
   const hasSub = !!chapter.has_subtitle;
   const hasTxt = !!(state.current && state.current.has_text);
   const subSegs = (state.subtitle.segments || []).length;
-  const showSub = hasSub || subSegs > 0 || asrRunning ||
-    (!hasTxt && ['failed', 'unavailable'].indexOf(asrState) >= 0);
+  const showSub = hasSub || subSegs > 0;
   if (!showSub && !hasTxt) { panel.hidden = true; return; }
   panel.hidden = false;
   const badge = $('p-sub-badge');
@@ -1630,13 +1414,7 @@ function paintPlayerText() {
   if (showSub) {
     const sub = state.subtitle;
     if (badge) {
-      if (!hasSub && asrRunning) {
-        badge.textContent = '转写中 ' + Math.round(asr.percent || 0) + '% · ' + (asr.cues || 0) + ' 句';
-      } else if (!hasSub && asrState === 'failed') {
-        badge.textContent = '转写失败';
-      } else if (!hasSub && asrState === 'unavailable') {
-        badge.textContent = '未启用';
-      } else if (sub.status === 'ready') {
+      if (sub.status === 'ready') {
         const fmt = (sub.format === 'words') ? '逐字同步'
           : (((sub.format || 'srt').toUpperCase()) + ' · ');
         badge.textContent = fmt + ' · ' + sub.segments.length + ' 句';
@@ -1650,16 +1428,7 @@ function paintPlayerText() {
     if (!state.textOn) { lines.hidden = true; lines.innerHTML = ''; return; }
     lines.hidden = false;
     if (!sub.segments.length) {
-      if (asrState === 'failed') {
-        lines.innerHTML = '<div class="np-lines-note">字幕转写失败：' + esc(asr.error || '未知原因') + '（播放不受影响）</div>';
-      } else if (asrState === 'unavailable') {
-        lines.innerHTML = '<div class="np-lines-note">本地转写引擎未启用，' +
-          '<button class="np-inline-link" data-act="goto-asr-install">去安装</button>后可在播放时自动生成字幕。</div>';
-      } else if (asrRunning) {
-        lines.innerHTML = '<div class="np-lines-note">正在转写本章字幕…首句约 30 秒内出现，可边转边看。</div>';
-      } else {
-        lines.innerHTML = '<div class="np-lines-note">字幕为空或格式无法识别</div>';
-      }
+      lines.innerHTML = '<div class="np-lines-note">字幕为空或格式无法识别</div>';
       return;
     }
     if (sub.status === 'error') {
@@ -1677,13 +1446,9 @@ function paintPlayerText() {
   const txt = state.txt;
   const matchText = { title: '章节名匹配', number: '章节序号匹配', order: '顺序对应', none: '未匹配' };
   if (badge) {
-    if (asrState === 'failed') badge.textContent = '转写失败 · 已显示文本';
-    else if (asrState === 'unavailable') badge.textContent = '未启用 · 已显示文本';
-    else {
-      badge.textContent = txt.status === 'ready'
-        ? ('TXT · ' + (matchText[txt.match] || '已定位'))
-        : (txt.status === 'loading' ? '载入中…' : (txt.status === 'error' ? '读取失败' : ''));
-    }
+    badge.textContent = txt.status === 'ready'
+      ? ('TXT · ' + (matchText[txt.match] || '已定位'))
+      : (txt.status === 'loading' ? '载入中…' : (txt.status === 'error' ? '读取失败' : ''));
   }
   lines.classList.add('np-lines-text');
   lines.style.setProperty('--p-size', state.textSize + 'px');
@@ -1893,7 +1658,6 @@ function playEntry(bookId, index, options) {
     syncMini();
     state.playing = true;
     startProgressSaver();
-    startAsr();
     if (route().name === 'player') render();
     else if (route().name === 'book') render();
   }).catch((err) => toast('播放失败：' + err.message));
@@ -2067,7 +1831,6 @@ audio.addEventListener('pause', () => {
   syncPlayerUI();
   syncBgmWithPlayback(false);
   saveProgress(false);
-  stopAsrPrefetch();
 });
 audio.addEventListener('durationchange', syncPlayerUI);
 audio.addEventListener('loadedmetadata', syncPlayerUI);
@@ -2185,7 +1948,7 @@ function viewMine() {
     '<div class="settings-grid"><div class="settings-nav">' +
     '<a data-act="jump" data-target="sec-account" class="active">账号与安全</a>' +
     '<a data-act="jump" data-target="sec-play">播放偏好</a>' +
-    '<a data-act="jump" data-target="sec-asr">AI 字幕（<span id="asr-nav-state">' + engineStateText() + '</span>）</a>' +
+    '<a data-act="jump" data-target="sec-asr">转写服务（<span id="asr-nav-state">' + asrServiceStateText() + '</span>）</a>' +
     '<a data-act="jump" data-target="sec-bgm">背景音乐</a>' +
     '<a data-act="jump" data-target="sec-library">书库与扫描</a>' +
     '<a data-act="jump" data-target="sec-connect">连接与扫码</a>' +
@@ -2220,10 +1983,10 @@ function viewMine() {
     '<button class="btn btn-ghost btn-sm danger-text" data-act="clear-progress" data-id="' + esc((state.current && state.current.id) || '') + '">清空当前书</button></div>' +
     '</section>' +
 
-    '<section class="panel" id="sec-asr"><div class="panel-head"><div><h2>AI 字幕（本地转写）</h2>' +
-    '<p>只有正在播放且没有 .srt/.lrc 的章节才会排队转写；独立进程运行、边转边写入字幕，不阻塞播放。</p></div>' +
-    '<span class="asr-state-pill ' + state.engine.state + '" id="asr-head-pill">' + engineStateText() + '</span></div>' +
-    '<div id="asr-panel-body">' + enginePanelBody() + '</div>' +
+    '<section class="panel" id="sec-asr"><div class="panel-head"><div><h2>转写服务</h2>' +
+    '<p>本应用只负责播放与字幕显示；批量把音频转成字幕由配套的独立 Docker 服务完成。转好的字幕写在音频同目录，播放时自动读取。</p></div>' +
+    '<span class="asr-state-pill ' + state.asrService.state + '" id="asr-head-pill">' + asrServiceStateText() + '</span></div>' +
+    '<div id="asr-panel-body">' + asrServicePanelBody() + '</div>' +
     '</section>' +
 
     '<section class="panel" id="sec-bgm"><div class="accordion" style="border-top:none;padding-top:0">' +
@@ -2287,13 +2050,12 @@ function ensureMineData() {
     loadUsers().catch(() => {}),
     loadBgm().catch(() => {}),
     loadPlaylists().catch(() => {}),
-    loadEngine().catch(() => {}),
-    (state.engine.checksLoaded ? Promise.resolve() : loadEngineChecks().catch(() => {})),
+    loadAsrService().catch(() => {}),
+    loadAsrToken().catch(() => {}),
   ]).then(() => {
     mineFetchedAt = Date.now();
     mineFetching = false;
     if (route().name === 'mine') { $('view').innerHTML = viewMine(); }
-    if (engineBusy()) ensureEnginePoll();
   }).catch(() => { mineFetching = false; });
 }
 
@@ -3012,22 +2774,10 @@ const ACTIONS = {
   'connect': openConnect,
   'clear-progress': (el) => clearProgress(el.dataset.id),
   'logout': logout,
-  'asr-install': () => startEngineInstall(),
-  'asr-cancel': () => cancelEngineInstall(),
-  'asr-model': (el) => changeEngineModel(el.dataset.model),
-  'asr-recheck': () => {
-    loadEngineChecks(true)
-      .then(() => { refreshEnginePanel(); toast('环境检测完成'); })
-      .catch((err) => toast(err.message || '检测失败'));
-  },
-  'goto-asr-install': () => {
-    go('#/mine');
-    setTimeout(() => {
-      const target = $('sec-asr');
-      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      $$('.settings-nav a').forEach((a) => a.classList.toggle('active', a.dataset.target === 'sec-asr'));
-    }, 160);
-  },
+  'asr-recheck': () => refreshAsrService(true),
+  'asr-open': () => openAsrService(),
+  'asr-save-url': () => refreshAsrService(true),
+  'asr-token-reset': () => resetAsrToken(),
   'jump': (el) => {
     const target = $(el.dataset.target);
     if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
