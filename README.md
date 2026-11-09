@@ -1,5 +1,8 @@
 # 书中有音（Shuzhong Youyin）
 
+> 项目地址：https://github.com/15338844785/shuzhongyouyin
+> FPK 安装包下载：https://github.com/15338844785/shuzhongyouyin/releases （`arm` / `x86` 两个版本，按设备架构选择）
+
 自托管的有声书管理与播放服务：扫描本地有声书目录、自动分章、在线刮削书名/作者/简介/封面、背景音乐播放、多端访问。纯 Python 标准库实现，零第三方依赖，单个 `server.py` 即可运行。
 
 > 本仓库是 Docker 化发行版。镜像同时提供 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 三种架构。

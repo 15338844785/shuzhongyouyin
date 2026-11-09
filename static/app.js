@@ -1765,6 +1765,8 @@ function viewMine() {
     '<section class="panel" id="sec-about"><div class="panel-head"><div><h2>关于书中有音</h2>' +
     '<p>Python 标准库实现的本地有声书服务，零第三方依赖。</p></div></div>' +
     '<div class="form-row"><div class="label">版本</div><div class="hint" id="about-version">—</div></div>' +
+    '<div class="form-row"><div class="label">开发者</div><div class="hint">乌云总会散开</div></div>' +
+    '<div class="form-row"><div class="label">GitHub 项目</div><div class="hint"><a href="https://github.com/15338844785/shuzhongyouyin" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;word-break:break-all">github.com/15338844785/shuzhongyouyin</a></div></div>' +
     '<div class="form-row"><div class="label">数据与隐私</div><div class="hint" style="max-width:520px;text-align:right">书库、进度与收藏均保存在本机数据目录，不上传任何媒体文件。</div></div>' +
     '<div class="form-row"><div class="label">账户</div><div class="hint">' + esc(u.username || '') + ' · ' + (u.role === 'admin' ? '管理员' : '书友') + '</div></div>' +
     '<div class="drawer-actions"><button class="btn btn-ghost btn-sm" data-act="logout">退出登录</button></div>' +

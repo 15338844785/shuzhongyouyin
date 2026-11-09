@@ -5952,7 +5952,7 @@ class DualStackServer(Server):
         Server.server_bind(self)
 
 
-APP_VERSION = "1.6.5"
+APP_VERSION = "1.6.6"
 # 实际监听端口（main() 启动时更新，供 /api/network 生成地址使用）
 LISTEN_PORT = int(os.environ.get("TRIM_SERVICE_PORT") or 8098)
 
