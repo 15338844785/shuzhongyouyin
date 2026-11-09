@@ -639,6 +639,7 @@ function cardFor(book) {
   const pr = progressOf(book);
   return '<a class="book-card" href="#/book/' + esc(book.id) + '">' +
     platformBadgeHtml(book) +
+    (book.readable === false ? '<span class="no-read-mark">无读取权限</span>' : '') +
     coverHTML(book, '', (book.chapter_count || 0) + ' 章') +
     '<h3>' + esc(book.title) + '</h3>' +
     '<div class="by">' + esc(book.author || book.narrator || '未知作者') + '</div>' +
@@ -955,6 +956,9 @@ function viewBook(book) {
     '<span class="ring"></span></div>' +
     '<div class="detail-info">' +
     '<h1>' + esc(book.title) + '</h1>' +
+    (book.readable === false
+      ? '<div class="warn-bar">该目录未授权给应用，无法播放。请在飞牛应用中心重新授权媒体目录后刷新本页。</div>'
+      : '') +
     '<div class="detail-meta">' + metaBits.join(' <span class="dot"></span> ') + '</div>' +
     (book.description
       ? '<div class="detail-desc-wrap detail-desc-top">' + clampHtml(book.description, 3) + '</div>'

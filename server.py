@@ -1144,14 +1144,63 @@ SUB_CACHE_LOCK = threading.Lock()
 
 
 def find_subtitle_source(audio_path):
-    """字幕来源优先级：xxx.words.json（字级）→ 同名 srt/lrc/vtt；返回 (kind, path)"""
+    """字幕来源优先级：xxx.words.json（字级）→ 同名 srt/lrc/vtt；返回 (kind, path)
+    同目录没有时再查 @appdata 回退目录（媒体目录只读时转写产物落在那里）。"""
     words = words_path_of(audio_path)
     if words and os.path.isfile(words):
         return "words", words
     path = find_subtitle(audio_path)
     if path:
         return "subtitle", path
+    return find_fallback_subtitle(audio_path)
+
+
+def fallback_subtitle_base(audio_path, book_id=""):
+    """目录不可写时的字幕基名：@appdata/shuzhongyouyin/subtitles/<book_id>/<stem>"""
+    if not audio_path:
+        return ""
+    stem = os.path.splitext(os.path.basename(audio_path))[0]
+    return os.path.join(STATE.data_dir, "subtitles", safe_stem(book_id or "unknown"), stem)
+
+
+def find_fallback_subtitle(audio_path):
+    """在回退字幕目录里按文件名查找（words → srt → lrc → vtt）"""
+    if not audio_path:
+        return "", ""
+    stem = os.path.splitext(os.path.basename(audio_path))[0]
+    root = os.path.join(STATE.data_dir, "subtitles")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return "", ""
+    for ext, kind in ((".words.json", "words"), (".srt", "subtitle"),
+                      (".lrc", "subtitle"), (".vtt", "subtitle")):
+        for name in names:
+            path = os.path.join(root, name, stem + ext)
+            if os.path.isfile(path):
+                return kind, path
     return "", ""
+
+
+def fallback_subtitle_index():
+    """扫描用索引：stem -> 回退字幕路径（一次 listdir，避免逐章遍历）"""
+    index = {}
+    root = os.path.join(STATE.data_dir, "subtitles")
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return index
+    for name in names:
+        folder = os.path.join(root, name)
+        try:
+            files = os.listdir(folder)
+        except OSError:
+            continue
+        for ext in (".words.json", ".srt", ".lrc", ".vtt"):
+            for fname in files:
+                if fname.endswith(ext):
+                    index.setdefault(fname[:-len(ext)], os.path.join(folder, fname))
+    return index
 
 
 def subtitle_payload(kind, path):
@@ -2661,6 +2710,7 @@ class AppState(object):
         self.settings.setdefault("extra_roots", [])
         self.settings.setdefault("scrape", {})
         self._migrate_roots()
+        self._heal_roots()
         self.metadata = load_json(self.metadata_path, {})
         self.metadata.setdefault("books", {})
         self.platform = load_json(self.platform_path, {})
@@ -2719,7 +2769,7 @@ class AppState(object):
                 elif isinstance(item, dict):
                     path = str(item.get("path") or "").strip()
                     role = item.get("role")
-                    if role not in ("book", "bgm", "media"):
+                    if role not in ("book", "bgm", "media", "library"):
                         role = "book"
                     if path:
                         entries.append({"path": path, "role": role})
@@ -2744,12 +2794,43 @@ class AppState(object):
         if deduped != entries:
             changed = True
         self.settings["roots"] = deduped
-        book_paths = [entry["path"] for entry in deduped if entry["role"] in ("book", "media")]
+        book_paths = [entry["path"] for entry in deduped if entry["role"] in ("book", "media", "library")]
         if self.settings.get("extra_roots") != book_paths:
             self.settings["extra_roots"] = book_paths
             changed = True
         if changed:
             self.save_settings()
+
+    def _heal_roots(self):
+        """自愈：飞牛授权的目录可能多于 settings.roots（升级/重装后授权记录丢失），
+        启动时把缺失且真实存在的授权目录补回 roots，避免书库根丢失后无法播放。"""
+        try:
+            granted = [p for p in self.accessible_paths() if p and os.path.isdir(p)]
+        except OSError:
+            return
+        if not granted:
+            return
+        known = set()
+        for entry in self.settings.get("roots") or []:
+            known.add(os.path.normcase(os.path.abspath(entry.get("path") or "")))
+        bgm_key = ""
+        bgm = str(self.settings.get("bgm_dir") or "").strip()
+        if bgm:
+            bgm_key = os.path.normcase(os.path.abspath(bgm))
+        added = []
+        for path in granted:
+            key = os.path.normcase(os.path.abspath(path))
+            if key in known:
+                continue
+            role = "bgm" if key == bgm_key else "library"
+            self.settings.setdefault("roots", []).append({"path": path, "role": role})
+            known.add(key)
+            added.append("%s(%s)" % (path, role))
+        if added:
+            self.save_settings()
+            print("[roots] 飞牛授权目录多于本地配置，自动补回 %d 个书库根: %s"
+                  % (len(added), ", ".join(added)), flush=True)
+
 
     def root_entries(self):
         """目录角色列表：[{path, role}]，role 为 book / bgm / media"""
@@ -2769,7 +2850,7 @@ class AppState(object):
             if appdest:
                 candidates.append(os.path.join(appdest, "shares"))
         candidates.extend(entry["path"] for entry in self.root_entries()
-                          if entry.get("role") in ("book", "media"))
+                          if entry.get("role") in ("book", "media", "library"))
 
         roots, seen = [], set()
         for path in candidates:
@@ -3975,6 +4056,7 @@ class AppState(object):
             "is_favorite": book["id"] in self.progress["favorites"],
             "library_type": "audiobook",
             "manual_corrected": bool(meta),
+            "readable": self.book_readable(book),
             "has_subtitle": bool(book.get("has_subtitle")),
             "chapter_count": book.get("chapter_count") or len(book.get("chapters") or []),
         }
@@ -4335,11 +4417,23 @@ class AppState(object):
         if sub_cache is None:
             sub_cache = {}
             self._scan_sub_cache = sub_cache
+        fallback_index = None
         for chapter in chapters:
             try:
                 subtitle = find_subtitle(chapter.get("_abs") or "", sub_cache)
             except Exception:
                 subtitle = ""
+            if not subtitle:
+                # 媒体目录只读时字幕落在 @appdata 回退目录，按文件名后缀匹配
+                if fallback_index is None:
+                    try:
+                        fallback_index = fallback_subtitle_index()
+                    except Exception:
+                        fallback_index = {}
+                audio = chapter.get("_abs") or ""
+                if audio:
+                    stem = os.path.splitext(os.path.basename(audio))[0]
+                    subtitle = fallback_index.get(stem) or ""
             if subtitle:
                 chapter["has_subtitle"] = True
                 chapter["_sub"] = subtitle
@@ -4646,6 +4740,15 @@ class AppState(object):
         self._status_thread.start()
         return True
 
+    def book_readable(self, book):
+        """应用进程能否真正读到这本书的首个章节（飞牛升级/重装后授权目录可能失效）"""
+        for chapter in book.get("chapters") or []:
+            path = chapter.get("_abs")
+            if path:
+                return os.access(path, os.R_OK)
+        folder = book.get("path") or ""
+        return bool(folder) and os.access(folder, os.R_OK | os.X_OK)
+
     def book_payload(self, book):
         chapters = []
         for chapter in book["chapters"]:
@@ -4671,6 +4774,7 @@ class AppState(object):
             "mtime": book["mtime"],
             "chapters": chapters,
             "has_subtitle": bool(book.get("has_subtitle") or any(c["has_subtitle"] for c in chapters)),
+            "readable": self.book_readable(book),
         }
         progress = self.book_progress(book["id"])
         chapter_count = max(1, book["chapter_count"])
@@ -5065,24 +5169,29 @@ class AsrManager(object):
         if not audio or not os.path.isfile(audio):
             return None, "音频文件不存在，请重新扫描"
         base = os.path.splitext(audio)[0]
+        fallback = False
+        # 媒体目录对应用用户只读时，字幕写到 @appdata 回退目录，保证「转一次就永久可用」
+        if not os.access(os.path.dirname(audio), os.W_OK | os.X_OK):
+            fb = fallback_subtitle_base(audio, book_id)
+            if fb:
+                try:
+                    os.makedirs(os.path.dirname(fb), exist_ok=True)
+                    if os.access(os.path.dirname(fb), os.W_OK):
+                        base = fb
+                        fallback = True
+                except OSError:
+                    pass
         return {
             "book": book, "chapter": chapter, "audio": audio,
             "srt": base + ".srt", "lrc": base + ".lrc",
-            "words": base + ".words.json",
+            "words": base + ".words.json", "fallback": fallback,
             "progress": os.path.join(ASR_JOBS_DIR,
                                      hashlib.sha1(audio.encode("utf-8")).hexdigest()[:16] + ".json"),
         }, ""
 
     def _same_stem_source(self, audio):
-        """只认同名文件（words 优先），用于状态查询与任务判定"""
-        base = os.path.splitext(audio)[0]
-        if os.path.isfile(base + ".words.json"):
-            return "words", base + ".words.json"
-        for ext in (".srt", ".lrc", ".vtt"):
-            path = base + ext
-            if os.path.isfile(path):
-                return "subtitle", path
-        return "", ""
+        """只认同名文件（words 优先，含 @appdata 回退目录），用于状态查询与任务判定"""
+        return find_subtitle_source(audio)
 
     def _task_key(self, book_id, index):
         return "%s:%d" % (book_id, index)
@@ -7297,6 +7406,10 @@ class Handler(BaseHTTPRequestHandler):
         # 不会把错误 JSON 追加进已发出的音频响应体（那会让播放器解出噪声）
         try:
             fp = open(path, "rb")
+        except PermissionError:
+            self.send_error_json(
+                "该目录未授权给应用，请在飞牛应用中心重新授权媒体目录后重试", 403)
+            return
         except OSError as exc:
             self.send_error_json("音频读取失败: %s" % exc, 500)
             return
@@ -7386,7 +7499,7 @@ class DualStackServer(Server):
         Server.server_bind(self)
 
 
-APP_VERSION = "1.6.9"
+APP_VERSION = "1.6.10"
 # 实际监听端口（main() 启动时更新，供 /api/network 生成地址使用）
 LISTEN_PORT = int(os.environ.get("TRIM_SERVICE_PORT") or 8098)
 

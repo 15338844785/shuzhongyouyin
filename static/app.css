@@ -245,6 +245,29 @@
   object-fit: cover;
 }
 .book-card { cursor: pointer; }
+.book-card .no-read-mark {
+  position: absolute;
+  z-index: 3;
+  left: 10px;
+  top: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--danger) 88%, transparent);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.6;
+  letter-spacing: 0.02em;
+  backdrop-filter: blur(4px);
+}
+.warn-bar {
+  margin: 8px 0 12px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
 .book-card .fav-mark {
   position: absolute;
   z-index: 2;
