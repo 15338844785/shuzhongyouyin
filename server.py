@@ -4,6 +4,7 @@
 
 import argparse
 import base64
+import collections
 import difflib
 import hashlib
 import html
@@ -12,11 +13,15 @@ import ipaddress
 import json
 import mimetypes
 import os
+import platform
 import re
 import secrets
+import shutil
 import signal
 import socket
 import ssl
+import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -1076,6 +1081,7 @@ def normalize_subtitle(segments):
             "start": round(start, 3),
             "end": round(float(end), 3),
             "text": item.get("text") or "",
+            "words": item.get("words") or [],
         })
     return result
 
@@ -1088,6 +1094,347 @@ def parse_subtitle_file(path, ext=None):
     kind = (ext or fmt_ext(path)).lower()
     segments = parse_lrc(text) if kind == ".lrc" else parse_timed_subtitle(text)
     return normalize_subtitle(segments), encoding
+
+
+def words_path_of(audio_path):
+    """转写产出的字级时间戳文件：与音频同名同目录的 xxx.words.json"""
+    if not audio_path:
+        return ""
+    return os.path.splitext(audio_path)[0] + ".words.json"
+
+
+def load_words_segments(path):
+    """读取 xxx.words.json 并规范化为统一 segments；损坏时返回空数组"""
+    data = load_json(path, None)
+    if not isinstance(data, dict):
+        return []
+    rows = []
+    for item in data.get("segments") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = float(item.get("start") or 0)
+            end = float(item.get("end") or start)
+        except (TypeError, ValueError):
+            continue
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        words = []
+        for word in item.get("words") or []:
+            if not isinstance(word, dict):
+                continue
+            token = str(word.get("t") or "")
+            if not token:
+                continue
+            try:
+                w_start = float(word.get("start") or 0)
+                w_end = float(word.get("end") or w_start)
+            except (TypeError, ValueError):
+                continue
+            words.append({"start": round(w_start, 3), "end": round(w_end, 3), "t": token})
+        rows.append({"start": start, "end": end, "text": text, "words": words})
+    return normalize_subtitle(rows)
+
+
+# 字幕解析结果缓存：按章节读、有上限，避免频繁 listdir/parse 和整份 words 常驻内存
+SUB_CACHE_MAX = 10
+SUB_CACHE = collections.OrderedDict()
+SUB_CACHE_LOCK = threading.Lock()
+
+
+def find_subtitle_source(audio_path):
+    """字幕来源优先级：xxx.words.json（字级）→ 同名 srt/lrc/vtt；返回 (kind, path)"""
+    words = words_path_of(audio_path)
+    if words and os.path.isfile(words):
+        return "words", words
+    path = find_subtitle(audio_path)
+    if path:
+        return "subtitle", path
+    return "", ""
+
+
+def subtitle_payload(kind, path):
+    """读取字幕并返回 {format, segments}，带 LRU 缓存（最多 SUB_CACHE_MAX 章）"""
+    try:
+        stat = os.stat(path)
+        stamp = (int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return None
+    key = os.path.normcase(path)
+    with SUB_CACHE_LOCK:
+        entry = SUB_CACHE.get(key)
+        if entry and entry[0] == stamp:
+            SUB_CACHE.move_to_end(key)
+            return entry[1]
+    if kind == "words":
+        segments = load_words_segments(path)
+        payload = {"format": "words", "segments": segments}
+        encoding = "utf-8"
+    else:
+        segments, encoding = parse_subtitle_file(path)
+        payload = {"format": fmt_ext(path).lstrip(".") or "srt", "segments": segments}
+    with SUB_CACHE_LOCK:
+        SUB_CACHE[key] = (stamp, payload)
+        SUB_CACHE.move_to_end(key)
+        while len(SUB_CACHE) > SUB_CACHE_MAX:
+            SUB_CACHE.popitem(last=False)
+    return payload
+
+
+# --------------------------------------------------------------------------
+# 章节正文：同目录 .txt
+# txt 没有时间轴，不伪造逐句同步；按章节名（必要时按章节序号）定位整章正文。
+# 索引按行流式构建，只记录每章的字节偏移，正文按章节分段读取，整本不常驻内存。
+# --------------------------------------------------------------------------
+
+TXT_DIR_CACHE = {}
+TXT_INDEX_CACHE = {}
+TXT_CACHE_LOCK = threading.Lock()
+TXT_CHAPTER_MAX_BYTES = 512 * 1024
+TXT_CHAPTER_NO_RE = re.compile(
+    r"^\s*第\s*([0-9]{1,6}|[一二三四五六七八九十百千万零〇两]{1,12})"
+    r"\s*[章节回集篇]\s*[：:、,，.\-—·]?\s*(.*?)\s*$")
+TXT_AUDIO_NAME_RE = re.compile(
+    r"^[0-9]{1,6}\s*-\s*(.+?)\s*-\s*([0-9]{1,6})\s*-\s*(.*)$")
+TXT_AUDIO_TITLE_RE = re.compile(
+    r"^\s*(?:第\s*)?([0-9]{1,6}|[一二三四五六七八九十百千万零〇两]{1,12})"
+    r"\s*[章节回集篇]\s*[：:、,，.\-— ]*(.*)$")
+TXT_BRACKET_RE = re.compile(r"[【\[（(].*?[】\]）)]")
+TXT_NOISE_RE = re.compile(
+    r"^(?:本章未完|本章完|（本章完）|\(本章完\)|请收藏|求收藏|求推荐|求月票|"
+    r"www\.|https?://|书海阁|笔趣阁)")
+TXT_PLACEHOLDER_RE = re.compile(r"^(?:[\[【(（]?\s*未下载\s*[\]】)）]?)$")
+
+
+def text_file_candidates(folder):
+    """同目录 txt：优先与目录同名的，其次体积最大的"""
+    if not folder:
+        return []
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return []
+    base = os.path.basename(folder).lower()
+    found = []
+    for name in names:
+        if name.startswith(".") or name.startswith("._") or fmt_ext(name) != ".txt":
+            continue
+        path = os.path.join(folder, name)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size <= 0:
+            continue
+        found.append({"path": path, "name": name, "size": size})
+    if not found:
+        return []
+    preferred = [item for item in found if base and base in strip_ext(item["name"]).lower()]
+    return sorted(preferred or found, key=lambda item: -item["size"])
+
+
+def find_book_text(folder):
+    """按目录 mtime 缓存 txt 查找结果，书库列表/详情重复打开不会反复 listdir"""
+    try:
+        stamp = int(os.stat(folder).st_mtime)
+    except OSError:
+        stamp = -1
+    key = os.path.normcase(os.path.abspath(folder)) if folder else ""
+    with TXT_CACHE_LOCK:
+        cached = TXT_DIR_CACHE.get(key)
+        if cached and cached[0] == stamp:
+            return cached[1]
+    candidates = text_file_candidates(folder)
+    result = candidates[0] if candidates else None
+    with TXT_CACHE_LOCK:
+        if len(TXT_DIR_CACHE) > 512:
+            TXT_DIR_CACHE.clear()
+        TXT_DIR_CACHE[key] = (stamp, result)
+    return result
+
+
+def sniff_text_encoding(path):
+    """只看文件头判断编码，避免把整本读进内存"""
+    try:
+        with open(path, "rb") as fp:
+            head = fp.read(8192)
+    except OSError:
+        return "utf-8"
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        for cut in (0, 1, 2, 3):
+            chunk = head[:len(head) - cut] if cut else head
+            try:
+                chunk.decode(encoding)
+                return encoding
+            except UnicodeDecodeError:
+                continue
+    return "utf-8"
+
+
+def text_title_key(text):
+    """章节名归一化：去括号注解、章序号与标点，只留文字用于匹配"""
+    text = TXT_BRACKET_RE.sub("", str(text or ""))
+    text = re.sub(r"第\s*(?:[0-9]{1,6}|[一二三四五六七八九十百千万零〇两]{1,12})\s*[章节回集篇]", "", text)
+    text = re.sub(r"^[\s0-9]+[-、,，.：: ]+", "", text)
+    text = re.sub(r"[^\u4e00-\u9fa5A-Za-z0-9]", "", text)
+    return text.lower()
+
+
+def audio_chapter_no_title(chapter):
+    """从音频章节标题/文件名提取 (章节序号, 标题文字)"""
+    for raw in (chapter.get("file_name") or "", chapter.get("title") or ""):
+        name = strip_ext(str(raw))
+        match = TXT_AUDIO_NAME_RE.match(name)
+        if match:
+            return int(match.group(2)), match.group(3)
+    title = str(chapter.get("title") or "")
+    match = TXT_AUDIO_TITLE_RE.match(title)
+    if match:
+        raw = match.group(1)
+        number = int(raw) if raw.isdigit() else cn_number(raw)
+        return number, match.group(2)
+    return None, title
+
+
+def get_text_index(path):
+    """构建/复用 txt 章节索引：只保存每章标题与字节偏移"""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    key = (path, stat.st_size, int(stat.st_mtime))
+    with TXT_CACHE_LOCK:
+        cached = TXT_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    encoding = sniff_text_encoding(path)
+    entries, pos = [], 0
+    try:
+        with open(path, "rb") as fp:
+            for raw in fp:
+                line = raw.decode(encoding, "ignore").replace("\ufeff", "").strip()
+                start = pos
+                pos += len(raw)
+                match = TXT_CHAPTER_NO_RE.match(line)
+                if not match:
+                    continue
+                number = int(match.group(1)) if match.group(1).isdigit() else cn_number(match.group(1))
+                entries.append({
+                    "no": number,
+                    "title": line,
+                    "key": text_title_key(match.group(2)),
+                    "start": start,
+                    "end": start,
+                })
+    except OSError:
+        return None
+    for index, entry in enumerate(entries):
+        entry["end"] = entries[index + 1]["start"] if index + 1 < len(entries) else stat.st_size
+    # 导出文件里常见「第一章 标题」目录行与「第1章标题」正文标题重复，
+    # 同名章节只保留最后一处（通常才带正文），避免定位到空目录行。
+    last_index = {}
+    for pos, entry in enumerate(entries):
+        if entry["key"]:
+            last_index[(entry["no"], entry["key"])] = pos
+    if last_index:
+        entries = [
+            entry for pos, entry in enumerate(entries)
+            if not entry["key"] or last_index[(entry["no"], entry["key"])] == pos
+        ]
+    result = {
+        "path": path,
+        "encoding": encoding,
+        "size": stat.st_size,
+        "chapters": entries,
+    }
+    with TXT_CACHE_LOCK:
+        if len(TXT_INDEX_CACHE) >= 24:
+            TXT_INDEX_CACHE.clear()
+        TXT_INDEX_CACHE[key] = result
+    return result
+
+
+def text_anchors(index, chapters):
+    """用能对上章节名的音频章节做锚点，供顺序对应时按就近偏移换算"""
+    cache = index.setdefault("_anchors", {})
+    key = id(chapters)
+    if key in cache:
+        return cache[key]
+    pos_by_key = {}
+    for pos, entry in enumerate(index.get("chapters") or []):
+        if entry["key"] and entry["key"] not in pos_by_key:
+            pos_by_key[entry["key"]] = pos
+    anchors = []
+    for pos, chapter in enumerate(chapters or []):
+        _, title = audio_chapter_no_title(chapter)
+        key_text = text_title_key(title)
+        if key_text and key_text in pos_by_key:
+            anchors.append((pos, pos_by_key[key_text]))
+    if len(cache) > 8:
+        cache.clear()
+    cache[key] = anchors
+    return anchors
+
+
+def match_text_chapter(index, chapter, audio_index, all_chapters):
+    """优先同名章节；找不到同名时按章节序号顺序对应"""
+    entries = index.get("chapters") or []
+    if not entries:
+        return None, "none"
+    number, title = audio_chapter_no_title(chapter)
+    key = text_title_key(title)
+    if key:
+        hits = [entry for entry in entries if entry["key"] == key]
+        if hits:
+            same = [entry for entry in hits if number is not None and entry["no"] == number]
+            return (same or hits)[0], "title"
+    anchors = text_anchors(index, all_chapters)
+    prev, nxt = None, None
+    for pos, text_pos in anchors:
+        if pos <= audio_index:
+            prev = (pos, text_pos)
+        elif nxt is None:
+            nxt = (pos, text_pos)
+            break
+    if prev:
+        text_pos = prev[1] + (audio_index - prev[0])
+    elif nxt:
+        text_pos = nxt[1] - (nxt[0] - audio_index)
+    else:
+        text_pos = audio_index
+    if 0 <= text_pos < len(entries):
+        return entries[text_pos], "order"
+    return None, "none"
+
+
+def read_text_chapter(index, entry):
+    """只读取该章区间；返回 (段落, 是否正文缺失, 是否截断)"""
+    start = entry["start"]
+    end = min(entry["end"], start + TXT_CHAPTER_MAX_BYTES)
+    truncated = entry["end"] > start + TXT_CHAPTER_MAX_BYTES
+    try:
+        with open(index["path"], "rb") as fp:
+            fp.seek(start)
+            raw = fp.read(max(0, end - start))
+    except OSError:
+        return [], False, False
+    text = raw.decode(index["encoding"], "ignore").replace("\ufeff", "")
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    paragraphs, placeholder = [], 0
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if TXT_CHAPTER_NO_RE.match(line):
+            continue  # 章节标题行（含目录里重复的那一份）
+        if TXT_PLACEHOLDER_RE.match(line):
+            placeholder += 1
+            continue
+        if TXT_NOISE_RE.match(line) or re.match(r"^=+.*=+$", line):
+            continue
+        paragraphs.append(line)
+    return paragraphs, bool(placeholder and not paragraphs), truncated
 
 
 def find_cover(folder, prefer_names=()):
@@ -3065,6 +3412,20 @@ class AppState(object):
         value = (self.meta_of(book["id"]).get("title") or "").strip()
         return value or book["title"]
 
+    def text_info(self, book):
+        """书籍同目录的 txt（按章节展示正文），没有返回 None"""
+        folder = book.get("path") or ""
+        if not folder:
+            chapters = book.get("chapters") or []
+            if chapters:
+                folder = os.path.dirname(chapters[0].get("_abs") or "")
+        if not folder:
+            return None
+        try:
+            return find_book_text(folder)
+        except Exception:
+            return None
+
     def scraped_cover(self, book_id):
         for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
             path = os.path.join(self.cover_dir, book_id + ext)
@@ -4329,6 +4690,857 @@ STATE = AppState()
 
 
 # --------------------------------------------------------------------------
+# 按需转写（AI 字幕）：独立子进程 + 单并发队列，不在 HTTP 请求路径里做识别
+# --------------------------------------------------------------------------
+
+_ASR_LEGACY_ROOT = "/vol2/1000/.transcribe"
+
+
+def _select_asr_root():
+    """优先沿用 /vol2/1000/.transcribe；应用账号无权访问时退回数据目录点号目录"""
+    env = os.environ.get("SY_ASR_ROOT")
+    if env:
+        return env
+    if os.path.isdir(_ASR_LEGACY_ROOT) and os.access(_ASR_LEGACY_ROOT, os.R_OK | os.X_OK):
+        return _ASR_LEGACY_ROOT
+    return os.path.join(STATE.data_dir, ".transcribe")
+
+
+ASR_ROOT = _select_asr_root()
+ASR_VENV_PY = os.path.join(ASR_ROOT, "venv", "bin", "python")
+ASR_SCRIPT = os.path.join(ASR_ROOT, "asr_stream.py")
+ASR_JOBS_DIR = os.path.join(ASR_ROOT, "jobs")
+ASR_LOG_DIR = os.path.join(ASR_ROOT, "logs")
+ASR_MODEL_DIR = os.path.join(ASR_ROOT, "models")
+ASR_TMP_DIR = os.path.join(ASR_ROOT, "tmp")
+ASR_BUNDLED_DIR = os.path.join(APP_DIR, "asr")
+ASR_INSTALL_SCRIPT = os.path.join(ASR_BUNDLED_DIR, "asr_install.py")
+ASR_ENGINE_PROGRESS = os.path.join(ASR_JOBS_DIR, "engine.json")
+ASR_THREADS = int(os.environ.get("SY_ASR_THREADS") or 4)
+ASR_ACTIVE_TTL = 300
+ASR_INSTALL_KEY = "engine:install"
+ASR_MODEL_NEED_MB = {"small": 1400, "medium": 2800, "large-v3": 4200}
+ASR_ARCH_ARM = ("aarch64", "arm64", "armv7l", "armv8l", "arm", "armhf")
+ASR_PYPI_INDEX = "https://mirrors.aliyun.com/pypi/simple/"
+ASR_HF_ENDPOINT = "https://hf-mirror.com"
+
+
+def safe_stem(text):
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fa5._-]+", "_", str(text or ""))[:80] or "chapter"
+
+
+def asr_child_preexec():
+    """转写/安装子进程降权：nice 10，把 CPU 优先级让给 HTTP 与音频流"""
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+
+
+def stop_task_proc(proc, timeout=3):
+    """按进程组终止（ionice/nice 包装后仍能带走整棵子进程树）"""
+    if not proc or proc.poll() is not None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except Exception:
+            try:
+                proc.send_signal(sig)
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=timeout)
+            return
+        except Exception:
+            continue
+
+
+def tail_text(path, limit=2400, lines=24):
+    """读日志尾部，便于在网页端直接看到失败原因"""
+    try:
+        with open(path, "rb") as fp:
+            fp.seek(0, os.SEEK_END)
+            size = fp.tell()
+            fp.seek(max(0, size - limit))
+            data = fp.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    return "\n".join(data.strip().splitlines()[-lines:])
+
+
+def url_reachable(url, timeout=6):
+    """连通性预检：拿到任何 HTTP 响应即视为可达"""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 shuzhongyouyin"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(1024)
+        return True, ""
+    except urllib.error.HTTPError as exc:
+        return True, "HTTP %s" % exc.code
+    except Exception as exc:
+        return False, str(exc)
+
+
+class AsrManager(object):
+    """按需转写任务队列：同一时刻只跑一个子进程，当前章优先，空闲可预转下一章"""
+
+    MAX_RETRIES = 1
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.tasks = {}
+        self.queue = []
+        self.active_book = ""
+        self.active_index = -1
+        self.last_seen = 0
+        self.worker = None
+        self.current_key = ""
+        self.disk_cache = (0, 0.0)
+        self.check_cache = (0.0, None)
+        for folder in (ASR_JOBS_DIR, ASR_LOG_DIR, ASR_TMP_DIR):
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError:
+                pass
+        self._recover()
+
+    # ------------------------------ 基础信息
+
+    def installed(self):
+        return os.path.isfile(ASR_VENV_PY) and os.path.isfile(ASR_SCRIPT)
+
+    def model_name(self):
+        cfg = STATE.settings.get("asr") if isinstance(STATE.settings.get("asr"), dict) else {}
+        model = str((cfg or {}).get("model") or "medium")
+        return model if model in ("small", "medium") else "medium"
+
+    def model_ready(self, model=None):
+        """模型目录存在即视为已下载；faster-whisper 的缓存布局是 models/models--Systran--..."""
+        model = model or self.model_name()
+        repo = "models--Systran--faster-whisper-" + model
+        path = os.path.join(ASR_MODEL_DIR, repo)
+        try:
+            return os.path.isdir(path) and bool(os.listdir(os.path.join(path, "snapshots")))
+        except OSError:
+            return False
+
+    def arch_info(self):
+        machine = (platform.machine() or "").lower()
+        arm = machine in ASR_ARCH_ARM or machine.startswith("arm")
+        if arm:
+            return {
+                "arch": machine or "arm",
+                "recommended": False,
+                "note": "当前架构 %s：这是低功耗 ARM 设备（约 3.9 GB 内存），"
+                        "不建议开启本地转写。可以安装，但单章转写可能需要十几分钟，"
+                        "且会明显占用 CPU。" % (machine or "arm"),
+            }
+        if machine in ("x86_64", "amd64"):
+            return {"arch": machine, "recommended": True,
+                    "note": "当前架构 x86_64，适合本地转写：单章 8–9 分钟音频约几分钟完成。"}
+        return {"arch": machine or "unknown", "recommended": False,
+                "note": "未能识别的 CPU 架构（%s），可尝试安装，速度与稳定性不作保证。" % (machine or "unknown")}
+
+    def disk_bytes(self):
+        now = time.time()
+        cached, stamp = self.disk_cache
+        if cached and now - stamp < 30:
+            return cached
+        total = 0
+        for path in (os.path.join(ASR_ROOT, "venv"), ASR_MODEL_DIR):
+            for root, _dirs, files in os.walk(path):
+                for name in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        pass
+        self.disk_cache = (total, now)
+        return total
+
+    # ------------------------------ 引擎状态 / 安装
+
+    def precheck(self, force=False):
+        """依赖预检：python3 / ffmpeg / 磁盘 / 阿里云 pypi / hf-mirror（结果缓存 2 分钟）"""
+        now = time.time()
+        cached_at, cached = self.check_cache
+        if not force and cached and now - cached_at < 120:
+            return cached
+        model = self.model_name()
+        checks = []
+        py = shutil.which("python3") or shutil.which("python")
+        version = ""
+        if py:
+            try:
+                version = subprocess.check_output(
+                    [py, "-V"], stderr=subprocess.STDOUT, timeout=10,
+                    text=True).strip()
+            except Exception as exc:
+                version = "无法运行：%s" % exc
+        checks.append({"key": "python3", "label": "python3", "ok": bool(py) and "Python 3" in version,
+                       "detail": version or "未找到 python3"})
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        checks.append({"key": "ffmpeg", "label": "ffmpeg / ffprobe", "ok": bool(ffmpeg and ffprobe),
+                       "detail": (ffmpeg or "未找到 ffmpeg") + ("" if ffprobe else "；缺少 ffprobe")})
+        try:
+            usage = shutil.disk_usage(ASR_ROOT if os.path.isdir(ASR_ROOT) else STATE.data_dir)
+            free_mb = int(usage.free / 1024 / 1024)
+        except OSError:
+            free_mb = -1
+        need = ASR_MODEL_NEED_MB.get(model, 2800)
+        checks.append({"key": "disk", "label": "磁盘空间", "ok": free_mb >= need,
+                       "detail": "剩余 %s MB / 需要约 %s MB" % (free_mb, need)})
+
+        results = {}
+
+        def probe(key, url):
+            results[key] = url_reachable(url)
+
+        threads = [
+            threading.Thread(target=probe, args=("pypi", ASR_PYPI_INDEX), daemon=True),
+            threading.Thread(target=probe, args=("hf", ASR_HF_ENDPOINT), daemon=True),
+        ]
+        for item in threads:
+            item.start()
+        for item in threads:
+            item.join(8)
+        ok, detail = results.get("pypi", (False, "检测超时"))
+        checks.append({"key": "pypi", "label": "阿里云 pypi 镜像", "ok": ok, "detail": detail or ASR_PYPI_INDEX})
+        ok, detail = results.get("hf", (False, "检测超时"))
+        checks.append({"key": "hf", "label": "hf-mirror 模型源", "ok": ok, "detail": detail or ASR_HF_ENDPOINT})
+        self.check_cache = (now, checks)
+        return checks
+
+    def _install_task(self):
+        task = self.tasks.get(ASR_INSTALL_KEY)
+        return task if task and task.get("kind") == "install" else None
+
+    def _install_active(self):
+        task = self._install_task()
+        return bool(task and task["state"] in ("queued", "running"))
+
+    def _latest_install_log(self):
+        try:
+            names = sorted((name for name in os.listdir(ASR_LOG_DIR) if name.startswith("install-")),
+                           reverse=True)
+        except OSError:
+            return ""
+        return os.path.join(ASR_LOG_DIR, names[0]) if names else ""
+
+    def engine_status(self):
+        progress = load_json(ASR_ENGINE_PROGRESS, None)
+        if not isinstance(progress, dict):
+            progress = {}
+        with self.lock:
+            task = self._install_task()
+            live = dict(task) if task else {}
+        installed = self.installed()
+        model = self.model_name()
+        model_ok = self.model_ready(model)
+        task_state = task.get("state") if task else ""
+        if task and task_state in ("queued", "running"):
+            state = "installing" if task_state == "running" else "queued"
+        elif task_state == "failed":
+            state = "failed"
+        elif installed and model_ok:
+            state = "ready"
+        elif progress.get("state") == "failed":
+            state = "failed"
+        else:
+            state = "missing"
+        arch = self.arch_info()
+        log_path = live.get("log_path") or self._latest_install_log()
+        percent = int(progress.get("percent") or 0)
+        step = progress.get("step") or ("排队中" if state == "queued" else "")
+        message = progress.get("message") or ""
+        error = (live.get("error") or progress.get("error") or "")
+        if state == "ready":
+            percent, step, message = 100, "完成", "引擎就绪"
+        return {
+            "ok": True,
+            "state": state,
+            "installed": installed,
+            "model": model,
+            "model_ready": model_ok,
+            "models": [
+                {"id": "small", "name": "small", "desc": "速度快、占用小，识别质量略低"},
+                {"id": "medium", "name": "medium", "desc": "识别质量更好，耗时约为 small 的 2 倍"},
+            ],
+            "arch": arch["arch"],
+            "arch_recommended": arch["recommended"],
+            "arch_note": arch["note"],
+            "disk_bytes": self.disk_bytes(),
+            "percent": percent,
+            "step": step,
+            "message": message,
+            "error": error,
+            "error_kind": progress.get("error_kind") or "",
+            "checks": self.check_cache[1] or progress.get("checks") or [],
+            "log_tail": tail_text(log_path, limit=4000, lines=28)
+            if state in ("installing", "failed", "missing") else "",
+            "started_at": progress.get("started_at") or 0,
+            "elapsed": progress.get("elapsed") or 0,
+        }
+
+    def install(self, model=None):
+        target = model if model in ("small", "medium") else self.model_name()
+        with self.lock:
+            if self._install_active():
+                return {"ok": True, "state": "installing"}
+            if self.installed() and self.model_ready(target):
+                return {"ok": True, "state": "ready"}
+            # 安装优先：取消排队/运行中的转写任务，避免装包与识别同时抢 CPU
+            for key in list(self.tasks.keys()):
+                if key == ASR_INSTALL_KEY:
+                    continue
+                other = self.tasks.get(key)
+                if other and other["state"] in ("queued", "running"):
+                    self._cancel_locked(key)
+            try:
+                if os.path.isfile(ASR_ENGINE_PROGRESS):
+                    os.remove(ASR_ENGINE_PROGRESS)
+            except OSError:
+                pass
+            cfg = STATE.settings.setdefault("asr", {})
+            if not isinstance(cfg, dict):
+                cfg = {}
+                STATE.settings["asr"] = cfg
+            cfg["model"] = target
+            STATE.save_settings()
+            task = {
+                "key": ASR_INSTALL_KEY, "kind": "install", "model": target,
+                "state": "queued", "error": "", "percent": 0, "step": "排队中",
+                "message": "", "proc": None, "log_fp": None, "log_path": "",
+                "progress": ASR_ENGINE_PROGRESS, "created": time.time(),
+                "started": 0, "finished": 0,
+            }
+            self.tasks[ASR_INSTALL_KEY] = task
+            self.queue.insert(0, ASR_INSTALL_KEY)
+            self.disk_cache = (0, 0.0)
+            self.check_cache = (0.0, None)
+            self._ensure_worker_locked()
+            return {"ok": True, "state": "queued"}
+
+    def cancel_install(self):
+        with self.lock:
+            task = self._install_task()
+            if task and task["state"] in ("queued", "running"):
+                data = load_json(ASR_ENGINE_PROGRESS, None)
+                if not isinstance(data, dict):
+                    data = {}
+                data["state"] = "cancelled"
+                data["message"] = "安装已取消"
+                data["finished_at"] = time.time()
+                try:
+                    save_json(ASR_ENGINE_PROGRESS, data)
+                except OSError:
+                    pass
+                self._cancel_locked(ASR_INSTALL_KEY)
+        return {"ok": True, "state": "cancelled"}
+
+    def set_model(self, model):
+        if model not in ("small", "medium"):
+            return {"ok": False, "error": "模型只支持 small 或 medium"}
+        cfg = STATE.settings.setdefault("asr", {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+            STATE.settings["asr"] = cfg
+        cfg["model"] = model
+        STATE.save_settings()
+        if self.installed() and not self.model_ready(model) and not self._install_active():
+            self.install(model)
+        return {"ok": True, "model": model, "engine": self.engine_status()}
+
+    def resolve(self, book_id, index):
+        """定位章节音频与输出路径"""
+        book = STATE.books_by_id.get(book_id)
+        if not book:
+            return None, "书籍不存在，请重新扫描"
+        chapters = book.get("chapters") or []
+        if index < 0 or index >= len(chapters):
+            return None, "章节不存在"
+        chapter = chapters[index]
+        audio = chapter.get("_abs") or ""
+        if not audio or not os.path.isfile(audio):
+            return None, "音频文件不存在，请重新扫描"
+        base = os.path.splitext(audio)[0]
+        return {
+            "book": book, "chapter": chapter, "audio": audio,
+            "srt": base + ".srt", "lrc": base + ".lrc",
+            "words": base + ".words.json",
+            "progress": os.path.join(ASR_JOBS_DIR,
+                                     hashlib.sha1(audio.encode("utf-8")).hexdigest()[:16] + ".json"),
+        }, ""
+
+    def _same_stem_source(self, audio):
+        """只认同名文件（words 优先），用于状态查询与任务判定"""
+        base = os.path.splitext(audio)[0]
+        if os.path.isfile(base + ".words.json"):
+            return "words", base + ".words.json"
+        for ext in (".srt", ".lrc", ".vtt"):
+            path = base + ext
+            if os.path.isfile(path):
+                return "subtitle", path
+        return "", ""
+
+    def _task_key(self, book_id, index):
+        return "%s:%d" % (book_id, index)
+
+    def _remove_outputs(self, task):
+        for key in ("srt", "lrc", "words"):
+            path = task.get(key) or ""
+            if path:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+        try:
+            if os.path.isfile(task.get("progress") or ""):
+                os.remove(task["progress"])
+        except OSError:
+            pass
+
+    def _recover(self):
+        """服务重启后清理上一轮未完成任务的半成品，避免被当成完整字幕"""
+        try:
+            names = os.listdir(ASR_JOBS_DIR)
+        except OSError:
+            return
+        for name in names:
+            if name == "engine.json":
+                continue
+            data = load_json(os.path.join(ASR_JOBS_DIR, name), None)
+            if not isinstance(data, dict):
+                continue
+            if data.get("state") in ("starting", "loading", "running", "cancelled", "failed"):
+                audio = data.get("audio") or ""
+                if not audio:
+                    continue
+                base = os.path.splitext(audio)[0]
+                for path in (base + ".srt", base + ".lrc", base + ".words.json"):
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                    except OSError:
+                        pass
+            try:
+                os.remove(os.path.join(ASR_JOBS_DIR, name))
+            except OSError:
+                pass
+
+    # ------------------------------ 对外操作
+
+    def start(self, book_id, index):
+        info, error = self.resolve(book_id, index)
+        if error:
+            return {"ok": False, "state": "failed", "error": error}
+        if self._install_active():
+            return {"ok": False, "state": "unavailable",
+                    "error": "本地转写引擎正在安装中，安装完成后会自动开始转写"}
+        if not self.installed():
+            return {"ok": False, "state": "unavailable", "error": "本地转写引擎未安装"}
+        key = self._task_key(book_id, index)
+        with self.lock:
+            task = self.tasks.get(key)
+            if task and task["state"] in ("queued", "running"):
+                self.active_book, self.active_index = book_id, index
+                self.last_seen = time.time()
+                task["prefetch"] = False
+                return {"ok": True, "state": task["state"]}
+            if task and task["state"] == "ready":
+                return {"ok": True, "state": "ready", "existing": True}
+            # 上一轮被打断留下的半成品：progress 未到 ready 就删掉重转
+            progress = load_json(info["progress"], None)
+            if isinstance(progress, dict) and progress.get("state") != "ready":
+                self._remove_outputs(info)
+            kind, path = find_subtitle_source(info["audio"])
+            if kind:
+                return {"ok": True, "state": "ready", "existing": True,
+                        "format": ("words" if kind == "words" else fmt_ext(path).lstrip(".")),
+                        "file": os.path.basename(path)}
+            self.active_book, self.active_index = book_id, index
+            self.last_seen = time.time()
+            # 切书 / 切章：其他未完成任务让位（半成品删除，稍后重新转）
+            for other in list(self.tasks.keys()):
+                if other == key:
+                    continue
+                task = self.tasks.get(other)
+                if task and task["state"] in ("queued", "running"):
+                    self._cancel_locked(other)
+            self._remove_outputs(info)
+            task = dict(info, key=key, book_id=book_id, index=index,
+                        state="queued", error="", retries=0, prefetch=False,
+                        cues=0, percent=0, first_cue_elapsed=0, duration=0,
+                        proc=None, log_fp=None, log_path="", created=time.time(),
+                        started=0, finished=0)
+            self.tasks[key] = task
+            if key not in self.queue:
+                self.queue.append(key)
+            self._ensure_worker_locked()
+            return {"ok": True, "state": "queued"}
+
+    def stop(self, book_id, keep_current=True):
+        with self.lock:
+            for key in list(self.tasks.keys()):
+                task = self.tasks.get(key)
+                if not task or task.get("book_id") != book_id:
+                    continue
+                if task["state"] not in ("queued", "running"):
+                    continue
+                if keep_current and task["index"] == self.active_index:
+                    continue
+                self._cancel_locked(key)
+            if not keep_current and self.active_book == book_id:
+                self.active_book, self.active_index = "", -1
+        return {"ok": True}
+
+    def status(self, book_id, index):
+        key = self._task_key(book_id, index)
+        with self.lock:
+            task = self.tasks.get(key)
+            if task is not None and book_id == self.active_book:
+                self.last_seen = time.time()
+            if task and task["state"] in ("queued", "running"):
+                self.last_seen = time.time()
+                data = load_json(task["progress"], None)
+                if isinstance(data, dict):
+                    task["cues"] = int(data.get("cues") or 0)
+                    task["percent"] = float(data.get("percent") or 0)
+                    task["duration"] = float(data.get("duration") or 0)
+                    task["done"] = float(data.get("done") or 0)
+                    task["first_cue_elapsed"] = float(data.get("first_cue_elapsed") or 0)
+                    if data.get("state") == "failed":
+                        task["error"] = data.get("error") or task["error"]
+            snapshot = dict(task) if task else {}
+        result = {
+            "ok": True, "state": "idle", "cues": 0, "percent": 0,
+            "duration": 0, "done": 0, "first_cue_elapsed": 0, "elapsed": 0,
+            "error": "", "log_tail": "", "model": self.model_name(),
+            "format": "", "subtitle_file": "",
+        }
+        if task:
+            result.update({
+                "state": task["state"], "cues": snapshot.get("cues", 0),
+                "percent": snapshot.get("percent", 0),
+                "duration": snapshot.get("duration", 0),
+                "done": snapshot.get("done", 0),
+                "first_cue_elapsed": snapshot.get("first_cue_elapsed", 0),
+                "error": snapshot.get("error") or "",
+                "log_tail": tail_text(task.get("log_path") or "") if task["state"] == "failed" else "",
+            })
+            if task["state"] in ("ready", "running"):
+                if task.get("started") and task["state"] == "ready":
+                    result["elapsed"] = round(task["finished"] - task["started"], 1)
+        info, error = self.resolve(book_id, index)
+        if not error:
+            kind, path = self._same_stem_source(info["audio"])
+            if kind:
+                result["format"] = "words" if kind == "words" else fmt_ext(path).lstrip(".")
+                result["subtitle_file"] = os.path.basename(path)
+                if not task or task["state"] in ("idle", "failed", "cancelled"):
+                    if kind == "words":
+                        result["state"] = "ready"
+        return result
+
+    # ------------------------------ 内部队列
+
+    def _ensure_worker_locked(self):
+        if self.worker and self.worker.is_alive():
+            return
+        self.worker = threading.Thread(target=self._worker_loop, name="asr-worker", daemon=True)
+        self.worker.start()
+
+    def _pick_locked(self):
+        install = self.tasks.get(ASR_INSTALL_KEY)
+        if install and install["state"] == "queued" and ASR_INSTALL_KEY in self.queue:
+            return ASR_INSTALL_KEY
+        active_key = self._task_key(self.active_book, self.active_index)
+        for key in list(self.queue):
+            task = self.tasks.get(key)
+            if not task:
+                self.queue.remove(key)
+                continue
+            if task["state"] != "queued":
+                self.queue.remove(key)
+                continue
+            if key == active_key:
+                return key
+        for key in list(self.queue):
+            task = self.tasks.get(key)
+            if task and task["state"] == "queued" and task["book_id"] == self.active_book:
+                return key
+        for key in list(self.queue):
+            task = self.tasks.get(key)
+            if task and task["state"] == "queued":
+                return key
+        return ""
+
+    def _cancel_locked(self, key):
+        task = self.tasks.get(key)
+        if not task:
+            return
+        if task.get("kind") == "install":
+            task["state"] = "cancelled"
+            proc = task.get("proc")
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=3)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            self._close_log(task)
+            if key in self.queue:
+                self.queue.remove(key)
+            if self.current_key == key:
+                self.current_key = ""
+            return
+        task["state"] = "cancelled"
+        proc = task.get("proc")
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._close_log(task)
+        self._remove_outputs(task)
+        if key in self.queue:
+            self.queue.remove(key)
+        if self.current_key == key:
+            self.current_key = ""
+
+    def _close_log(self, task):
+        fp = task.get("log_fp")
+        if fp:
+            try:
+                fp.close()
+            except Exception:
+                pass
+            task["log_fp"] = None
+
+    def _launch_locked(self, task):
+        if task.get("kind") == "install":
+            return self._launch_install_locked(task)
+        if not self.installed():
+            task["error"] = "本地转写引擎未安装"
+            return False
+        self._remove_outputs(task)
+        model = self.model_name()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        log_path = os.path.join(
+            ASR_LOG_DIR, "%s.%s.log" % (safe_stem(os.path.splitext(os.path.basename(task["audio"]))[0]), stamp))
+        cmd = [ASR_VENV_PY, ASR_SCRIPT,
+               "--audio", task["audio"], "--srt", task["srt"],
+               "--lrc", task["lrc"], "--words", task["words"],
+               "--progress", task["progress"], "--model", model,
+               "--threads", str(ASR_THREADS)]
+        ionice = shutil.which("ionice")
+        if ionice:
+            cmd = [ionice, "-c", "2", "-n", "7"] + cmd
+        env = os.environ.copy()
+        env["SY_ASR_ROOT"] = ASR_ROOT
+        task["state"] = "running"
+        task["started"] = time.time()
+        task["error"] = ""
+        task["log_path"] = log_path
+        try:
+            log_fp = open(log_path, "wb")
+            log_fp.write(("$ %s\n" % " ".join(cmd)).encode("utf-8"))
+            log_fp.flush()
+            task["proc"] = subprocess.Popen(
+                cmd, cwd=ASR_ROOT, env=env, stdout=log_fp, stderr=subprocess.STDOUT,
+                start_new_session=True, preexec_fn=asr_child_preexec)
+            task["log_fp"] = log_fp
+            return True
+        except OSError as exc:
+            task["error"] = "启动转写进程失败: %s" % exc
+            return False
+
+    def _launch_install_locked(self, task):
+        """安装器用系统 python3 运行，不依赖待创建的 venv"""
+        script = ASR_INSTALL_SCRIPT
+        if not os.path.isfile(script):
+            fallback = os.path.join(ASR_ROOT, "asr_install.py")
+            script = fallback if os.path.isfile(fallback) else ""
+        if not script:
+            task["error"] = "安装脚本缺失：%s" % ASR_INSTALL_SCRIPT
+            return False
+        py = shutil.which("python3") or shutil.which("python") or "python3"
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        log_dir = ASR_LOG_DIR
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError:
+            log_dir = os.path.join(STATE.data_dir, "asr-logs")
+            os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "install-%s.log" % stamp)
+        cmd = [py, script, "--root", ASR_ROOT, "--model", task["model"],
+               "--progress", ASR_ENGINE_PROGRESS, "--log", log_path]
+        task["state"] = "running"
+        task["started"] = time.time()
+        task["error"] = ""
+        task["log_path"] = log_path
+        env = os.environ.copy()
+        env["SY_ASR_ROOT"] = ASR_ROOT
+        try:
+            log_fp = open(log_path, "wb")
+            log_fp.write(("$ %s\n" % " ".join(cmd)).encode("utf-8"))
+            log_fp.flush()
+            task["proc"] = subprocess.Popen(
+                cmd, cwd=STATE.data_dir, env=env, stdout=log_fp, stderr=subprocess.STDOUT,
+                start_new_session=True)
+            task["log_fp"] = log_fp
+            return True
+        except OSError as exc:
+            task["error"] = "启动安装进程失败: %s" % exc
+            return False
+
+    def _wait(self, task):
+        proc = task.get("proc")
+        last = 0.0
+        while proc.poll() is None:
+            if task["state"] == "cancelled":
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
+            now = time.time()
+            if now - last >= 1.0:
+                last = now
+                data = load_json(task.get("progress") or "", None)
+                if isinstance(data, dict):
+                    task["percent"] = float(data.get("percent") or 0)
+                    task["step"] = data.get("step") or task.get("step", "")
+                    task["message"] = data.get("message") or ""
+                    if data.get("error"):
+                        task["error"] = data.get("error") or task["error"]
+                    if data.get("state") == "failed":
+                        task["error"] = data.get("error") or task["error"]
+                    if task.get("kind") != "install":
+                        task["cues"] = int(data.get("cues") or 0)
+                        task["duration"] = float(data.get("duration") or 0)
+                        task["done"] = float(data.get("done") or 0)
+                        task["first_cue_elapsed"] = float(data.get("first_cue_elapsed") or 0)
+            time.sleep(0.6)
+        return proc.returncode
+
+    def _finish_locked(self, task, code):
+        task["finished"] = time.time()
+        self._close_log(task)
+        key = task["key"]
+        if self.current_key == key:
+            self.current_key = ""
+        if task["state"] == "cancelled":
+            self._remove_outputs(task)
+            return
+        if task.get("kind") == "install":
+            data = load_json(ASR_ENGINE_PROGRESS, None)
+            if not isinstance(data, dict):
+                data = {}
+            ok = (self.installed() and self.model_ready(task["model"])
+                  and data.get("state") == "ready")
+            if ok:
+                task["state"] = "ready"
+                task["percent"] = 100
+                task["error"] = ""
+                self.disk_cache = (0, 0.0)
+            else:
+                tail = tail_text(task.get("log_path") or "", lines=4)
+                lines = [line for line in tail.splitlines() if line.strip()]
+                task["state"] = "failed"
+                task["error"] = (task.get("error") or data.get("error")
+                                 or (lines[-1] if lines else "")
+                                 or ("安装进程退出码 %s" % code))
+            return
+        data = load_json(task.get("progress") or "", None)
+        state = data.get("state") if isinstance(data, dict) else ""
+        srt_ok = os.path.isfile(task["srt"]) and os.path.getsize(task["srt"]) > 0
+        if state == "ready" and srt_ok:
+            task["state"] = "ready"
+            task["cues"] = int(data.get("cues") or 0)
+            task["percent"] = 100
+            task["error"] = ""
+            self._maybe_prefetch_locked()
+            return
+        error = ""
+        if isinstance(data, dict) and data.get("error"):
+            error = str(data["error"])
+        if not error:
+            error = tail_text(task.get("log_path") or "", lines=3) or ("转写进程退出码 %s" % code)
+        still_wanted = (task["book_id"] == self.active_book and task["index"] == self.active_index)
+        if task["retries"] < self.MAX_RETRIES and still_wanted:
+            task["retries"] += 1
+            task["state"] = "queued"
+            task["error"] = ""
+            self._remove_outputs(task)
+            if key not in self.queue:
+                self.queue.append(key)
+            return
+        task["state"] = "failed"
+        task["error"] = error
+        self._remove_outputs(task)
+
+    def _maybe_prefetch_locked(self):
+        """空闲时预转当前书的下一章；仅在用户仍在收听（有心跳）时进行"""
+        if not self.active_book or time.time() - self.last_seen > ASR_ACTIVE_TTL:
+            return
+        next_index = self.active_index + 1
+        info, error = self.resolve(self.active_book, next_index)
+        if error:
+            return
+        kind, _path = find_subtitle_source(info["audio"])
+        if kind:
+            return
+        key = self._task_key(self.active_book, next_index)
+        if key in self.tasks:
+            return
+        task = dict(info, key=key, book_id=self.active_book, index=next_index,
+                    state="queued", error="", retries=0, prefetch=True,
+                    cues=0, percent=0, first_cue_elapsed=0, duration=0,
+                    proc=None, log_fp=None, log_path="", created=time.time(),
+                    started=0, finished=0)
+        self.tasks[key] = task
+        self.queue.append(key)
+        self._ensure_worker_locked()
+
+    def _worker_loop(self):
+        while True:
+            with self.lock:
+                if not self.queue:
+                    self.worker = None
+                    return
+                key = self._pick_locked()
+                if not key:
+                    self.worker = None
+                    return
+                if key in self.queue:
+                    self.queue.remove(key)
+                task = self.tasks.get(key)
+                if not task or task["state"] != "queued":
+                    continue
+                self.current_key = key
+                launched = self._launch_locked(task)
+                if not launched:
+                    self._finish_locked(task, 0)
+                    continue
+            code = self._wait(task)
+            with self.lock:
+                self._finish_locked(task, code)
+
+
+ASR = AsrManager()
+
+
+# --------------------------------------------------------------------------
 # HTTP 服务
 # --------------------------------------------------------------------------
 
@@ -4552,8 +5764,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(STATE.compat_progress(path[len("/api/progress/"):]))
             elif path == "/api/books":
                 self.send_json({"ok": True, "books": [STATE.compat_book(b) for b in STATE.books]})
+            elif path == "/api/asr/engine":
+                self.send_json(ASR.engine_status())
+            elif path == "/api/asr/engine/precheck":
+                self.send_json({"ok": True, "checks": ASR.precheck(force="force=1" in parsed.query)})
+            elif path.startswith("/api/books/") and "/asr/" in path and path.endswith("/status"):
+                self.handle_asr_status(path[len("/api/books/"):-len("/status")])
             elif path.startswith("/api/books/") and path.endswith("/subtitle"):
                 self.handle_book_subtitle(path[len("/api/books/"):-len("/subtitle")])
+            elif path.startswith("/api/books/") and path.endswith("/text"):
+                self.handle_book_text(path[len("/api/books/"):-len("/text")])
             elif path.startswith("/api/books/"):
                 self.handle_compat_book(path[len("/api/books/"):])
             elif path == "/api/playlists":
@@ -4677,6 +5897,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.handle_user_create()
             elif path.startswith("/api/users/") and path.endswith("/avatar"):
                 self.handle_avatar_upload(path[len("/api/users/"):-len("/avatar")])
+            elif path == "/api/asr/engine/install":
+                self.handle_engine_install()
+            elif path == "/api/asr/engine/cancel":
+                self.handle_engine_cancel()
+            elif path == "/api/asr/engine/model":
+                self.handle_engine_model()
+            elif path.startswith("/api/books/") and "/asr/" in path and path.endswith("/start"):
+                self.handle_asr_start(path[len("/api/books/"):-len("/start")])
+            elif path.startswith("/api/books/") and "/asr/" in path and path.endswith("/stop"):
+                self.handle_asr_stop(path[len("/api/books/"):-len("/stop")])
             elif path.startswith("/api/books/") and path.endswith("/chapters/reset"):
                 self.handle_compat_chapter_reset(path[len("/api/books/"):-len("/chapters/reset")])
             elif path.startswith("/api/books/") and path.endswith("/scrape-apply"):
@@ -4812,6 +6042,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json("书籍不存在，请重新扫描", 404)
             return
         data = book_api(STATE, book)
+        text = STATE.text_info(book)
+        data["has_text"] = bool(text)
+        data["text_file"] = text["name"] if text else ""
         data["ok"] = True
         self.send_json(data)
 
@@ -4830,7 +6063,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True, "platform": record, "summary": STATE.platform_summary()})
 
     def handle_book_subtitle(self, rest):
-        """/api/books/<book_id>/chapters/<index>/subtitle：按章节返回解析后的段落"""
+        """/api/books/<book_id>/chapters/<index>/subtitle
+
+        统一契约（网页端 / 鸿蒙 / 安卓共用）：
+        {"format":"words|srt|lrc|none","segments":[{"start","end","text","words":[{"start","end","t"}]}]}
+        来源优先级：xxx.words.json（字级）→ 同名 srt/lrc/vtt（words 为空数组）。
+        """
         parts = [part for part in rest.split("/") if part]
         if len(parts) != 3 or parts[1] != "chapters":
             self.send_error_json("接口路径错误", 400)
@@ -4850,23 +6088,35 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json("章节不存在", 404)
             return
         chapter = chapters[index]
-        path = chapter.get("_sub") or ""
-        if not path or not os.path.isfile(path):
+        audio = chapter.get("_abs") or ""
+        kind, path = find_subtitle_source(audio) if audio else ("", "")
+        if not path:
             # 兼容旧书库数据：扫描时未记录字幕的章节按需补查一次
-            path = find_subtitle(chapter.get("_abs") or "")
+            fallback = chapter.get("_sub") or ""
+            if fallback and os.path.isfile(fallback):
+                kind = "words" if fallback.endswith(".words.json") else "subtitle"
+                path = fallback
         if not path or not os.path.isfile(path):
             self.send_json({
-                "ok": False,
+                "ok": True,
                 "has_subtitle": False,
-                "error": "本章没有字幕文件",
                 "book_id": book_id,
                 "chapter": index,
-            }, 404)
+                "format": "none",
+                "count": 0,
+                "segments": [],
+            })
             return
         try:
-            segments, encoding = parse_subtitle_file(path)
+            payload = subtitle_payload(kind, path)
         except Exception as exc:
             self.send_error_json("字幕解析失败: %s" % exc, 500)
+            return
+        if payload is None:
+            self.send_json({
+                "ok": True, "has_subtitle": False, "book_id": book_id,
+                "chapter": index, "format": "none", "count": 0, "segments": [],
+            })
             return
         self.send_json({
             "ok": True,
@@ -4874,10 +6124,172 @@ class Handler(BaseHTTPRequestHandler):
             "book_id": book_id,
             "chapter": index,
             "file": os.path.basename(path),
-            "format": fmt_ext(path).lstrip("."),
-            "encoding": encoding,
-            "count": len(segments),
-            "segments": segments,
+            "format": payload["format"],
+            "encoding": "utf-8",
+            "count": len(payload["segments"]),
+            "segments": payload["segments"],
+        })
+
+    def _asr_parts(self, rest, want_index=True):
+        parts = [part for part in rest.split("/") if part]
+        need = 3 if want_index else 2
+        if len(parts) != need or parts[1] != "asr":
+            self.send_error_json("接口路径错误", 400)
+            return None
+        book_id = parts[0]
+        if not want_index:
+            return {"book_id": book_id}
+        try:
+            index = int(parts[2])
+        except ValueError:
+            self.send_error_json("章节序号错误", 400)
+            return None
+        return {"book_id": book_id, "index": index}
+
+    def handle_asr_start(self, rest):
+        """POST /api/books/<id>/asr/<index>/start：网页端开始播放某章时排队转写"""
+        args = self._asr_parts(rest)
+        if not args:
+            return
+        user = self.require_auth()
+        if not user:
+            return
+        self.send_json({"ok": True, "asr": ASR.start(args["book_id"], args["index"])})
+
+    def handle_asr_status(self, rest):
+        """GET /api/books/<id>/asr/<index>/status：转写进度（状态徽标 + 部分字幕）"""
+        args = self._asr_parts(rest)
+        if not args:
+            return
+        self.send_json({"ok": True, "asr": ASR.status(args["book_id"], args["index"])})
+
+    def handle_asr_stop(self, rest):
+        """POST /api/books/<id>/asr/stop：切走书/停止播放时让位，取消非当前章任务"""
+        args = self._asr_parts(rest, want_index=False)
+        if not args:
+            return
+        user = self.require_auth()
+        if not user:
+            return
+        data = self.read_json() or {}
+        keep_current = bool(data.get("keep_current", True))
+        ASR.stop(args["book_id"], keep_current)
+        self.send_json({"ok": True})
+
+    def handle_engine_install(self):
+        """POST /api/asr/engine/install：一键安装本地转写引擎（后台任务，与转写共用队列）"""
+        user = self.require_auth()
+        if not user:
+            return
+        data = self.read_json() or {}
+        model = data.get("model") if isinstance(data.get("model"), str) else None
+        result = ASR.install(model)
+        self.send_json({"ok": True, "install": result, "engine": ASR.engine_status()})
+
+    def handle_engine_cancel(self):
+        """POST /api/asr/engine/cancel：中断安装（保留已下载的包与模型）"""
+        user = self.require_auth()
+        if not user:
+            return
+        ASR.cancel_install()
+        self.send_json({"ok": True, "engine": ASR.engine_status()})
+
+    def handle_engine_model(self):
+        """POST /api/asr/engine/model：切换 small / medium（缺少模型时后台补下载）"""
+        user = self.require_auth()
+        if not user:
+            return
+        data = self.read_json() or {}
+        result = ASR.set_model(str(data.get("model") or ""))
+        self.send_json(result)
+
+    def handle_book_text(self, rest):
+        """/api/books/<book_id>/chapters/<index>/text：按章节返回 txt 整章正文"""
+        parts = [part for part in rest.split("/") if part]
+        if len(parts) != 3 or parts[1] != "chapters":
+            self.send_error_json("接口路径错误", 400)
+            return
+        book_id, index_raw = parts[0], parts[2]
+        book = STATE.books_by_id.get(book_id)
+        if not book:
+            self.send_error_json("书籍不存在，请重新扫描", 404)
+            return
+        try:
+            index = int(index_raw)
+        except ValueError:
+            self.send_error_json("章节序号错误", 400)
+            return
+        chapters = book.get("chapters") or []
+        if index < 0 or index >= len(chapters):
+            self.send_error_json("章节不存在", 404)
+            return
+        text = STATE.text_info(book)
+        if not text:
+            self.send_json({
+                "ok": False,
+                "has_text": False,
+                "error": "本书目录下没有 txt 正文",
+                "book_id": book_id,
+                "chapter": index,
+            }, 404)
+            return
+        data = get_text_index(text["path"])
+        if not data or not data.get("chapters"):
+            self.send_json({
+                "ok": False,
+                "has_text": False,
+                "error": "txt 中未识别到「第 X 章」形式的章节标题",
+                "book_id": book_id,
+                "chapter": index,
+                "file": text["name"],
+            }, 404)
+            return
+        entry, match = match_text_chapter(data, chapters[index], index, chapters)
+        if not entry:
+            self.send_json({
+                "ok": True,
+                "has_text": True,
+                "book_id": book_id,
+                "chapter": index,
+                "file": text["name"],
+                "format": "txt",
+                "encoding": data["encoding"],
+                "total": len(data["chapters"]),
+                "match": match,
+                "audio_title": chapters[index].get("title") or "",
+                "text_chapter": None,
+                "text_title": "",
+                "paragraphs": [],
+                "body_missing": False,
+                "truncated": False,
+                "note": "txt 中没有同名章节，按顺序也未能对应到本章",
+            })
+            return
+        paragraphs, missing, truncated = read_text_chapter(data, entry)
+        note = ""
+        if missing:
+            note = "该 txt 为目录导出：本章正文标记为「[未下载]」，请替换为含正文的 txt 后重试"
+        elif not paragraphs:
+            note = "本章正文为空"
+        elif truncated:
+            note = "本章正文过长，仅显示前 %d KB" % (TXT_CHAPTER_MAX_BYTES // 1024)
+        self.send_json({
+            "ok": True,
+            "has_text": True,
+            "book_id": book_id,
+            "chapter": index,
+            "file": text["name"],
+            "format": "txt",
+            "encoding": data["encoding"],
+            "total": len(data["chapters"]),
+            "match": match,
+            "audio_title": chapters[index].get("title") or "",
+            "text_chapter": entry["no"],
+            "text_title": entry["title"],
+            "paragraphs": paragraphs,
+            "body_missing": missing,
+            "truncated": truncated,
+            "note": note,
         })
 
     def handle_scan_status(self):
@@ -5064,6 +6476,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_json({"ok": True, "user": STATE.public_user(user)})
 
+    def _log_login_fail(self, username, reason):
+        """只记录失败登录：时间、来源 IP、用户名、原因；成功不写，避免刷屏"""
+        try:
+            path = os.path.join(STATE.data_dir, "login-fail.log")
+            try:
+                if os.path.getsize(path) > 1024 * 1024:
+                    os.replace(path, path + ".1")
+            except OSError:
+                pass
+            ip = (self.client_address or ("",))[0]
+            line = "%s\t%s\t%s\t%s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), ip, username or "-",
+                " ".join(str(reason or "-").split()))
+            with open(path, "a", encoding="utf-8") as fp:
+                fp.write(line)
+        except OSError:
+            pass
+
     def handle_compat_login(self):
         data = self.read_json() or {}
         username = (data.get("username") or data.get("user") or "").strip()
@@ -5081,8 +6511,10 @@ class Handler(BaseHTTPRequestHandler):
             if fnos_user:
                 self.send_login(fnos_user)
                 return
+            self._log_login_fail(username, error or "账号或密码不正确")
             self.send_error_json(error or "账号或密码不正确", 401)
             return
+        self._log_login_fail(username, "账号或密码不正确")
         self.send_error_json("账号或密码不正确", 401)
 
     def send_login(self, user):
@@ -5109,6 +6541,7 @@ class Handler(BaseHTTPRequestHandler):
         data = self.read_json() or {}
         user, error = STATE.fnos_claim(data.get("state"), data.get("code"))
         if error:
+            self._log_login_fail("fnos-claim", error)
             self.send_error_json(error, 400)
             return
         token = STATE.new_session(user)
@@ -5137,6 +6570,7 @@ class Handler(BaseHTTPRequestHandler):
         data = self.read_json() or {}
         user = STATE.claim_login_ticket(str(data.get("ticket") or ""))
         if not user:
+            self._log_login_fail("ticket", "登录票据无效或已过期")
             self.send_error_json("登录票据无效或已过期，请重新扫码", 401)
             return
         token = STATE.new_session(user)
@@ -5952,7 +7386,7 @@ class DualStackServer(Server):
         Server.server_bind(self)
 
 
-APP_VERSION = "1.6.6"
+APP_VERSION = "1.6.8"
 # 实际监听端口（main() 启动时更新，供 /api/network 生成地址使用）
 LISTEN_PORT = int(os.environ.get("TRIM_SERVICE_PORT") or 8098)
 

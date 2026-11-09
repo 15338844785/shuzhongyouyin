@@ -65,7 +65,20 @@ const state = {
   dirRoles: [],
   scanReport: { scanned: [], skipped: [], duplicates: 0 },
   subtitle: { key: '', status: 'idle', format: '', encoding: '', segments: [], error: '' },
+  asr: { key: '', state: 'none', cues: 0, percent: 0, error: '', duration: 0, first: 0, model: '' },
+  asrTimer: null,
+  engine: {
+    state: 'missing', installed: false, model: 'medium', model_ready: false, models: [],
+    arch: '', arch_recommended: true, arch_note: '', disk_bytes: 0,
+    percent: 0, step: '', message: '', error: '', error_kind: '', checks: [],
+    log_tail: '', elapsed: 0, checksLoaded: false,
+  },
+  engineTimer: null,
+  engineWaitTimer: null,
+  txt: { key: '', status: 'idle', match: '', textTitle: '', paragraphs: [], missingBody: false, note: '', error: '' },
   textOn: localStorage.getItem('sy_text') !== '0',
+  textSize: parseFloat(localStorage.getItem('sy_text_size') || '15') || 15,
+  textGap: parseFloat(localStorage.getItem('sy_text_gap') || '1.9') || 1.9,
   chapterGroupBook: '',
   chapterGroup: 0,
   bookShown: null,
@@ -449,7 +462,7 @@ function render() {
     case 'playlists': view.innerHTML = viewPlaylists(); break;
     case 'playlist': view.innerHTML = viewPlaylistDetail(r.arg); break;
     case 'book': renderBook(r.arg); return;
-    case 'player': view.innerHTML = viewPlayer(); syncPlayerUI(); ensureSubtitle(); return;
+    case 'player': view.innerHTML = viewPlayer(); syncPlayerUI(); ensureSubtitle(); startAsr(); return;
     case 'mine': view.innerHTML = viewMine(); ensureMineData(); return;
     default: view.innerHTML = viewHome();
   }
@@ -1116,7 +1129,9 @@ function viewPlayer() {
   const pr = progressOf(book);
   const chapter = book.chapters[state.chapter] || {};
   const total = (book.chapters || []).length;
-  const hasText = !!chapter.has_subtitle;
+  const hasTxt = !!book.has_text;
+  const asrNow = asrOfChapter();
+  const hasText = !!chapter.has_subtitle || hasTxt || asrVisible(asrNow);
   const pal = palette(book.id || book.title || 'book');
   const coverImg = book.cover_url
     ? '<img class="np-cover-art" src="' + esc(appUrl(book.cover_url)) + '" alt="" onerror="this.remove()">' : '';
@@ -1132,8 +1147,15 @@ function viewPlayer() {
             (book.author ? ' · ' + esc(book.author) : '') + '</div>' +
           (hasText ?
             '<div class="np-text" id="p-text">' +
-              '<div class="np-text-head"><span class="np-text-title">同步文字</span>' +
+              '<div class="np-text-head"><span class="np-text-title">' +
+              (chapter.has_subtitle || (asrNow && asrNow.state !== 'failed') ? '同步文字' : '章节文本') + '</span>' +
               '<span class="np-sub-badge" id="p-sub-badge"></span>' +
+              (!chapter.has_subtitle ? '<div class="np-text-tools">' +
+                '<button class="np-tool" data-act="text-size" data-delta="-1" title="缩小字号">A−</button>' +
+                '<button class="np-tool" data-act="text-size" data-delta="1" title="放大字号">A＋</button>' +
+                '<button class="np-tool" data-act="text-gap" data-delta="-1" title="收紧行距">行−</button>' +
+                '<button class="np-tool" data-act="text-gap" data-delta="1" title="放宽行距">行＋</button>' +
+                '</div>' : '') +
               '<button class="np-text-toggle" id="p-text-toggle" data-act="player-text">' +
               (state.textOn ? '隐藏文字' : '显示文字') + '</button></div>' +
               '<div class="np-lines" id="p-lines"></div>' +
@@ -1154,6 +1176,8 @@ function viewPlayer() {
         '</div>' +
         '<div class="np-controls">' +
           '<div class="np-side">' +
+            '<button class="np-util ' + (state.textOn ? 'on' : '') + '" data-act="player-text" title="章节文本">' +
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M6 4h9l4 4v12H6z"/><path d="M9 11h7M9 15h7"/></svg><span>文本</span></button>' +
             '<button class="np-util" data-act="player-chapters" title="跳到章节">' +
             '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span>章节</span></button>' +
             '<button class="np-util" id="p-fav" data-act="toggle-fav" data-id="' + esc(book.id) + '" title="收藏">' +
@@ -1184,7 +1208,7 @@ function viewPlayer() {
     '</div>';
 }
 
-/* 章节字幕：仅当扫描阶段检测到 .lrc/.srt/.vtt 时才会渲染文字区 */
+/* 播放页文字：有同名字幕时字幕优先（高亮跟随）；否则按章节显示 txt 整段正文 */
 function subtitleKeyOf() {
   return state.current ? (state.current.id + ':' + state.chapter) : '';
 }
@@ -1193,36 +1217,391 @@ function currentChapter() {
   return (state.current && state.current.chapters && state.current.chapters[state.chapter]) || {};
 }
 
+function emptyTxtState() {
+  return { key: '', status: 'none', match: '', textTitle: '', paragraphs: [], missingBody: false, note: '', error: '' };
+}
+
+/* ---------------------------- 按需转写（AI 字幕） ---------------------------- */
+
+function asrKeyOf() {
+  return state.current ? (state.current.id + ':' + state.chapter) : '';
+}
+
+function asrOfChapter() {
+  if (!state.current) return null;
+  return state.asr && state.asr.key === asrKeyOf() ? state.asr : null;
+}
+
+function asrVisible(a) {
+  return !!a && ['queued', 'running', 'ready', 'failed', 'unavailable'].indexOf(a.state) >= 0;
+}
+
+function applyAsrState(info) {
+  if (!state.asr) return;
+  state.asr.state = info.state || 'queued';
+  state.asr.cues = Number(info.cues || 0);
+  state.asr.percent = Number(info.percent || 0);
+  state.asr.error = info.error || '';
+  state.asr.duration = Number(info.duration || 0);
+  state.asr.first = Number(info.first_cue_elapsed || 0);
+  state.asr.model = info.model || '';
+}
+
+function startAsr() {
+  if (!state.current) return Promise.resolve();
+  const bookId = state.current.id;
+  const idx = state.chapter;
+  const key = bookId + ':' + idx;
+  if (currentChapter().has_subtitle) {
+    if (state.asr.key !== key) state.asr = { key: key, state: 'none', cues: 0, percent: 0, error: '', duration: 0, first: 0, model: '' };
+    return Promise.resolve();
+  }
+  const cur = asrOfChapter();
+  if (cur && ['queued', 'running'].indexOf(cur.state) >= 0) {
+    ensureAsrPoll();
+    return Promise.resolve();
+  }
+  if (cur && cur.state === 'ready' && (state.subtitle.segments || []).length) {
+    return Promise.resolve();
+  }
+  /* 播放即排队：只有正在听的这一章会进队列，没在听的书不会触发 */
+  state.asr = { key: key, state: 'queued', cues: 0, percent: 0, error: '', duration: 0, first: 0, model: '' };
+  ensureAsrPoll();
+  if (route().name === 'player') paintPlayerText();
+  return api('/api/books/' + encodeURIComponent(bookId) + '/asr/' + idx + '/start', {
+    method: 'POST', body: '{}',
+  }).then((data) => {
+    if (state.asr.key !== key) return;
+    applyAsrState(data.asr || {});
+    if (state.asr.state === 'ready') {
+      stopAsrPoll();
+      reloadSubtitle(bookId, idx);
+    } else if (state.asr.state === 'unavailable' || state.asr.state === 'failed') {
+      stopAsrPoll();
+      if (state.asr.state === 'unavailable') waitEngineThenAsr(bookId, idx);
+    }
+    if (route().name === 'player') paintPlayerText();
+  }).catch((err) => {
+    if (state.asr.key !== key) return;
+    state.asr.state = 'failed';
+    state.asr.error = err.message || '转写启动失败';
+    if (route().name === 'player') paintPlayerText();
+  });
+}
+
+function ensureAsrPoll() {
+  if (state.asrTimer) return;
+  state.asrTimer = setInterval(asrPollTick, 3000);
+}
+
+function stopAsrPoll() {
+  if (state.asrTimer) {
+    clearInterval(state.asrTimer);
+    state.asrTimer = null;
+  }
+}
+
+function asrPollTick() {
+  const a = asrOfChapter();
+  if (!a || route().name !== 'player') return;
+  if (['queued', 'running'].indexOf(a.state) < 0) { stopAsrPoll(); return; }
+  const bookId = state.current.id;
+  const idx = state.chapter;
+  const key = bookId + ':' + idx;
+  api('/api/books/' + encodeURIComponent(bookId) + '/asr/' + idx + '/status').then((data) => {
+    if (!state.current || asrKeyOf() !== key) return;
+    const beforeCues = a.cues || 0;
+    const beforeState = a.state;
+    applyAsrState(data.asr || {});
+    if ((state.asr.cues !== beforeCues || state.asr.state !== beforeState) && route().name === 'player') {
+      paintPlayerText();
+    }
+    /* 字幕中途出现时自动加载，不需要用户刷新 */
+    if (state.asr.cues > 0 || (state.asr.state === 'ready' && beforeState !== 'ready')) {
+      reloadSubtitle(bookId, idx);
+    }
+    if (['ready', 'failed', 'unavailable'].indexOf(state.asr.state) >= 0) stopAsrPoll();
+  }).catch(() => {});
+}
+
+function reloadSubtitle(bookId, idx) {
+  const key = bookId + ':' + idx;
+  api('/api/books/' + encodeURIComponent(bookId) + '/chapters/' + idx + '/subtitle').then((data) => {
+    if (!state.current || asrKeyOf() !== key) return;
+    if (!data.segments || !data.segments.length) return;
+    const same = state.subtitle.key === key && state.subtitle.segments.length === data.segments.length;
+    state.subtitle = {
+      key: key, status: 'ready', format: data.format || 'srt',
+      encoding: data.encoding || '', segments: data.segments, error: '',
+    };
+    if (route().name === 'player' && !same) { paintPlayerText(); syncPlayerText(); }
+  }).catch(() => {});
+}
+
+function stopAsrPrefetch() {
+  if (!state.current) return;
+  api('/api/books/' + encodeURIComponent(state.current.id) + '/asr/stop', {
+    method: 'POST', body: JSON.stringify({ keep_current: true }),
+  }).catch(() => {});
+}
+
+/* ---------------------------- 本地转写引擎（设置页安装 / 状态） ---------------------------- */
+
+function applyEngine(info) {
+  if (!info) return;
+  state.engine = Object.assign({}, state.engine, info);
+  if (info.checks && info.checks.length) state.engine.checksLoaded = true;
+}
+
+function loadEngine() {
+  return api('/api/asr/engine').then((info) => {
+    applyEngine(info || {});
+    return state.engine;
+  });
+}
+
+function loadEngineChecks(force) {
+  return api('/api/asr/engine/precheck' + (force ? '?force=1' : ''))
+    .then((data) => {
+      state.engine.checks = data.checks || [];
+      state.engine.checksLoaded = true;
+      return state.engine.checks;
+    });
+}
+
+function engineBusy() {
+  return ['queued', 'installing'].indexOf(state.engine.state) >= 0;
+}
+
+function ensureEnginePoll() {
+  if (state.engineTimer) return;
+  state.engineTimer = setInterval(enginePollTick, 2000);
+}
+
+function stopEnginePoll() {
+  if (state.engineTimer) {
+    clearInterval(state.engineTimer);
+    state.engineTimer = null;
+  }
+}
+
+function enginePollTick() {
+  api('/api/asr/engine').then((info) => {
+    applyEngine(info || {});
+    if (!engineBusy()) stopEnginePoll();
+    if (route().name === 'mine') refreshEnginePanel();
+    if (route().name === 'player' && state.engine.state === 'ready') {
+      paintPlayerText();
+      if (asrOfChapter() && asrOfChapter().state === 'unavailable') startAsr();
+    }
+  }).catch(() => { stopEnginePoll(); });
+}
+
+function startEngineInstall() {
+  state.engine.state = 'queued';
+  state.engine.step = '排队中';
+  state.engine.percent = 0;
+  ensureEnginePoll();
+  refreshEnginePanel();
+  api('/api/asr/engine/install', { method: 'POST', body: '{}' }).then((data) => {
+    applyEngine(data.engine || {});
+    if (engineBusy()) ensureEnginePoll();
+    refreshEnginePanel();
+  }).catch((err) => {
+    state.engine.state = 'failed';
+    state.engine.error = err.message || '安装启动失败';
+    refreshEnginePanel();
+  });
+}
+
+function cancelEngineInstall() {
+  api('/api/asr/engine/cancel', { method: 'POST', body: '{}' }).then((data) => {
+    applyEngine(data.engine || {});
+    stopEnginePoll();
+    refreshEnginePanel();
+    toast('安装已取消');
+  }).catch((err) => toast(err.message || '取消失败'));
+}
+
+function changeEngineModel(model) {
+  if (!model || model === state.engine.model) return;
+  api('/api/asr/engine/model', { method: 'POST', body: JSON.stringify({ model: model }) })
+    .then((data) => {
+      if (data.ok === false) throw new Error(data.error || '切换失败');
+      applyEngine(data.engine || {});
+      if (engineBusy()) ensureEnginePoll();
+      refreshEnginePanel();
+      toast('已切换到 ' + model + ' 模型');
+    }).catch((err) => toast(err.message || '切换失败'));
+}
+
+/* 播放页检测到引擎未安装/安装中时，就绪后自动开始转写，无需用户刷新 */
+function waitEngineThenAsr(bookId, idx) {
+  if (state.engineWaitTimer) return;
+  const key = bookId + ':' + idx;
+  state.engineWaitTimer = setInterval(() => {
+    if (route().name !== 'player' || !state.current || asrKeyOf() !== key) {
+      clearInterval(state.engineWaitTimer);
+      state.engineWaitTimer = null;
+      return;
+    }
+    api('/api/asr/engine').then((info) => {
+      applyEngine(info || {});
+      if (state.engine.state === 'ready') {
+        clearInterval(state.engineWaitTimer);
+        state.engineWaitTimer = null;
+        state.asr = { key: '', state: 'none', cues: 0, percent: 0, error: '', duration: 0, first: 0, model: '' };
+        if (state.current && asrKeyOf() === key && route().name === 'player') startAsr();
+      }
+    }).catch(() => {});
+  }, 5000);
+}
+
+function refreshEnginePanel() {
+  const box = $('asr-panel-body');
+  if (box) box.innerHTML = enginePanelBody();
+  const nav = $('asr-nav-state');
+  if (nav) nav.textContent = engineStateText();
+  const pill = $('asr-head-pill');
+  if (pill) {
+    pill.textContent = engineStateText();
+    pill.className = 'asr-state-pill ' + state.engine.state;
+  }
+}
+
+function engineStateText() {
+  const map = { ready: '就绪', installing: '安装中', queued: '排队中', failed: '失败', missing: '未安装' };
+  return map[state.engine.state] || '未安装';
+}
+
+function enginePanelBody() {
+  const e = state.engine;
+  const busy = engineBusy();
+  const checks = e.checks || [];
+  const checkRows = checks.length
+    ? '<div class="asr-checks">' + checks.map((c) =>
+      '<div class="asr-check ' + (c.ok ? 'ok' : 'bad') + '">' +
+      '<span class="dot"></span><b>' + esc(c.label) + '</b>' +
+      '<span class="detail">' + esc(c.detail || '') + '</span></div>').join('') + '</div>'
+    : '<div class="hint">点「环境检测」检查 python3 / ffmpeg / 磁盘 / 镜像连通性。</div>';
+  const archRow = '<div class="form-row"><div><div class="label">当前架构</div>' +
+    '<div class="hint">' + esc(e.arch_note || '检测中…') + '</div></div>' +
+    '<span class="asr-arch ' + (e.arch_recommended ? 'ok' : 'warn') + '">' +
+    esc(e.arch || '—') + (e.arch_recommended ? ' · 推荐' : ' · 不推荐') + '</span></div>';
+  const modelRow = '<div class="form-row"><div><div class="label">识别模型</div>' +
+    '<div class="hint">' + ((e.models || []).find((m) => m.id === e.model) || {}).desc +
+    (!busy && e.installed && !e.model_ready ? ' · 新模型尚未下载' : '') + '</div></div>' +
+    '<div class="segmented">' + ['small', 'medium'].map((id) =>
+      '<button class="' + (e.model === id ? 'active' : '') + '" data-act="asr-model" data-model="' + id + '"' +
+      (busy ? ' disabled' : '') + '>' + id + '</button>').join('') + '</div></div>';
+  const diskRow = '<div class="form-row"><div><div class="label">占用磁盘</div>' +
+    '<div class="hint">独立 venv 与模型都放在点号目录，不参与书库扫描</div></div>' +
+    '<span class="badge gray">' + fmtSize(e.disk_bytes || 0) + '</span></div>';
+
+  let statusBlock = '';
+  let actions = '';
+  if (busy) {
+    statusBlock = '<div class="asr-progress"><div class="asr-progress-head"><b>' +
+      esc(e.step || '安装中') + '</b><span>' + Math.round(e.percent || 0) + '%</span></div>' +
+      '<div class="asr-bar"><i style="width:' + Math.min(100, Math.max(0, Number(e.percent || 0))) + '%"></i></div>' +
+      (e.message ? '<div class="hint">' + esc(e.message) + '</div>' : '') +
+      (e.log_tail ? '<details class="asr-log"><summary>安装日志</summary><pre>' + esc(e.log_tail) + '</pre></details>' : '') +
+      '</div>';
+    actions = '<button class="btn btn-ghost btn-sm" data-act="asr-cancel">中断安装</button>';
+  } else if (e.state === 'ready') {
+    statusBlock = '<div class="empty-note asr-ready"><b>引擎已就绪</b>' +
+      '<span>播放无字幕章节时会自动排队转写，边转边写入字幕；已有 .srt/.lrc 的章节不会重复转写。</span></div>';
+    actions = '<button class="btn btn-ghost btn-sm" data-act="asr-recheck">重新检测环境</button>';
+  } else if (e.state === 'failed') {
+    statusBlock = '<div class="empty-note asr-failed"><b>安装失败' +
+      (e.error_kind ? '（' + esc({ network: '网络', disk: '磁盘', permission: '权限', dependency: '缺少依赖' }[e.error_kind] || e.error_kind) + '）' : '') +
+      '</b><span>' + esc(e.error || '未知原因') + '</span></div>' +
+      (e.log_tail ? '<details class="asr-log" open><summary>安装日志</summary><pre>' + esc(e.log_tail) + '</pre></details>' : '');
+    actions = '<button class="btn btn-primary btn-sm" data-act="asr-install">重试安装</button>';
+  } else {
+    statusBlock = '<div class="empty-note"><b>本地转写引擎尚未安装</b>' +
+      '<span>安装后可在播放时按需生成 AI 字幕（第一次每章首句约 30 秒内出现）。</span></div>';
+    actions = '<button class="btn btn-primary btn-sm" data-act="asr-install">一键安装</button>';
+  }
+
+  return '<div class="asr-status-line"><span class="asr-state-pill ' + (e.state || 'missing') + '">' +
+    engineStateText() + '</span>' +
+    '<span class="hint">模型 ' + esc(e.model || 'medium') + '</span>' +
+    (e.elapsed ? '<span class="hint">上次耗时 ' + Math.round(Number(e.elapsed) || 0) + ' 秒</span>' : '') +
+    '</div>' +
+    statusBlock + archRow + modelRow + diskRow +
+    '<div class="asr-check-head"><div class="label">依赖预检</div>' +
+    '<button class="btn btn-ghost btn-sm" data-act="asr-recheck">环境检测</button></div>' +
+    checkRows +
+    '<div class="asr-actions">' + actions + '</div>';
+}
+
 function ensureSubtitle() {
   const panel = $('p-text');
   if (!panel || !state.current) return Promise.resolve();
   const chapter = currentChapter();
-  if (!chapter.has_subtitle) {
+  const key = subtitleKeyOf();
+  const asr = asrOfChapter();
+  const asrHas = !!asr && (asr.state === 'ready' || asr.cues > 0);
+  if (chapter.has_subtitle || asrHas) {
+    state.txt = emptyTxtState();
+    if (state.subtitle.key === key && ['ready', 'loading'].indexOf(state.subtitle.status) >= 0) {
+      paintPlayerText();
+      return Promise.resolve();
+    }
+    state.subtitle = { key: key, status: 'loading', format: '', encoding: '', segments: [], error: '' };
+    paintPlayerText();
+    return api('/api/books/' + encodeURIComponent(state.current.id) +
+      '/chapters/' + state.chapter + '/subtitle').then((data) => {
+      if (state.subtitle.key !== key) return;
+      state.subtitle = {
+        key: key, status: 'ready',
+        format: data.format || '', encoding: data.encoding || '',
+        segments: data.segments || [], error: '',
+      };
+      paintPlayerText();
+      syncPlayerText();
+    }).catch((err) => {
+      if (state.subtitle.key !== key) return;
+      state.subtitle = { key: key, status: 'error', format: '', encoding: '', segments: [], error: err.message || '读取失败' };
+      paintPlayerText();
+    });
+  }
+  if (!state.current.has_text) {
     state.subtitle = { key: '', status: 'none', format: '', encoding: '', segments: [], error: '' };
     return Promise.resolve();
   }
-  const key = subtitleKeyOf();
-  if (state.subtitle.key === key && ['ready', 'loading'].indexOf(state.subtitle.status) >= 0) {
+  if (state.txt.key === key && ['ready', 'loading'].indexOf(state.txt.status) >= 0) {
     paintPlayerText();
     return Promise.resolve();
   }
-  state.subtitle = { key: key, status: 'loading', format: '', encoding: '', segments: [], error: '' };
+  state.txt = { key: key, status: 'loading', match: '', textTitle: '', paragraphs: [], missingBody: false, note: '', error: '' };
   paintPlayerText();
   return api('/api/books/' + encodeURIComponent(state.current.id) +
-    '/chapters/' + state.chapter + '/subtitle').then((data) => {
-    if (state.subtitle.key !== key) return;
-    state.subtitle = {
-      key: key, status: 'ready',
-      format: data.format || '', encoding: data.encoding || '',
-      segments: data.segments || [], error: '',
+    '/chapters/' + state.chapter + '/text').then((data) => {
+    if (state.txt.key !== key) return;
+    state.txt = {
+      key: key, status: 'ready', match: data.match || '',
+      textTitle: data.text_title || '', paragraphs: data.paragraphs || [],
+      missingBody: !!data.body_missing, note: data.note || '',
+      encoding: data.encoding || '', error: '',
     };
     paintPlayerText();
-    syncPlayerText();
+    // txt 没有时间轴：章节切换后只回到本章开头，不做逐句高亮
+    const lines = $('p-lines');
+    if (lines && state.textOn) lines.scrollTop = 0;
   }).catch((err) => {
-    if (state.subtitle.key !== key) return;
-    state.subtitle = { key: key, status: 'error', format: '', encoding: '', segments: [], error: err.message || '读取失败' };
+    if (state.txt.key !== key) return;
+    state.txt = { key: key, status: 'error', match: '', textTitle: '', paragraphs: [], missingBody: false, note: '', error: err.message || '读取失败' };
     paintPlayerText();
   });
+}
+
+function wordHtml(seg) {
+  const words = (seg && seg.words) || [];
+  if (!words.length) return esc(seg.text);
+  return words.map((w) => '<span class="np-w" data-s="' + Number(w.start || 0) +
+    '" data-e="' + Number(w.end || 0) + '">' + esc(w.t) + '</span>').join('');
 }
 
 function paintPlayerText() {
@@ -1230,39 +1609,124 @@ function paintPlayerText() {
   const lines = $('p-lines');
   if (!panel || !lines) return;
   const chapter = currentChapter();
-  if (!chapter.has_subtitle) { panel.hidden = true; return; }
+  const asr = asrOfChapter();
+  const asrState = asr ? asr.state : '';
+  const asrRunning = ['queued', 'running'].indexOf(asrState) >= 0;
+  const hasSub = !!chapter.has_subtitle;
+  const hasTxt = !!(state.current && state.current.has_text);
+  const subSegs = (state.subtitle.segments || []).length;
+  const showSub = hasSub || subSegs > 0 || asrRunning ||
+    (!hasTxt && ['failed', 'unavailable'].indexOf(asrState) >= 0);
+  if (!showSub && !hasTxt) { panel.hidden = true; return; }
   panel.hidden = false;
-  const sub = state.subtitle;
   const badge = $('p-sub-badge');
-  if (badge) {
-    badge.textContent = sub.status === 'ready'
-      ? ((sub.format || 'srt').toUpperCase() + ' · ' + sub.segments.length + ' 句')
-      : (sub.status === 'loading' ? '载入中…' : (sub.status === 'error' ? '读取失败' : ''));
-  }
   const toggle = $('p-text-toggle');
   if (toggle) toggle.textContent = state.textOn ? '隐藏文字' : '显示文字';
+
+  if (showSub) {
+    const sub = state.subtitle;
+    if (badge) {
+      if (!hasSub && asrRunning) {
+        badge.textContent = '转写中 ' + Math.round(asr.percent || 0) + '% · ' + (asr.cues || 0) + ' 句';
+      } else if (!hasSub && asrState === 'failed') {
+        badge.textContent = '转写失败';
+      } else if (!hasSub && asrState === 'unavailable') {
+        badge.textContent = '未启用';
+      } else if (sub.status === 'ready') {
+        const fmt = (sub.format === 'words') ? '逐字同步'
+          : (((sub.format || 'srt').toUpperCase()) + ' · ');
+        badge.textContent = fmt + ' · ' + sub.segments.length + ' 句';
+      } else {
+        badge.textContent = sub.status === 'loading' ? '载入中…' : (sub.status === 'error' ? '读取失败' : '');
+      }
+    }
+    lines.classList.remove('np-lines-text', 'missing');
+    lines.style.removeProperty('--p-size');
+    lines.style.removeProperty('--p-gap');
+    if (!state.textOn) { lines.hidden = true; lines.innerHTML = ''; return; }
+    lines.hidden = false;
+    if (!sub.segments.length) {
+      if (asrState === 'failed') {
+        lines.innerHTML = '<div class="np-lines-note">字幕转写失败：' + esc(asr.error || '未知原因') + '（播放不受影响）</div>';
+      } else if (asrState === 'unavailable') {
+        lines.innerHTML = '<div class="np-lines-note">本地转写引擎未启用，' +
+          '<button class="np-inline-link" data-act="goto-asr-install">去安装</button>后可在播放时自动生成字幕。</div>';
+      } else if (asrRunning) {
+        lines.innerHTML = '<div class="np-lines-note">正在转写本章字幕…首句约 30 秒内出现，可边转边看。</div>';
+      } else {
+        lines.innerHTML = '<div class="np-lines-note">字幕为空或格式无法识别</div>';
+      }
+      return;
+    }
+    if (sub.status === 'error') {
+      lines.innerHTML = '<div class="np-lines-note">字幕读取失败：' + esc(sub.error) + '</div>';
+      return;
+    }
+    lines.innerHTML = sub.segments.map((seg, i) =>
+      '<button class="np-line" data-act="player-seek" data-index="' + i + '">' +
+      '<span class="np-line-t">' + fmtTime(seg.start) + '</span>' +
+      '<span class="np-line-x">' + wordHtml(seg) + '</span></button>').join('');
+    syncPlayerText();
+    return;
+  }
+
+  const txt = state.txt;
+  const matchText = { title: '章节名匹配', number: '章节序号匹配', order: '顺序对应', none: '未匹配' };
+  if (badge) {
+    if (asrState === 'failed') badge.textContent = '转写失败 · 已显示文本';
+    else if (asrState === 'unavailable') badge.textContent = '未启用 · 已显示文本';
+    else {
+      badge.textContent = txt.status === 'ready'
+        ? ('TXT · ' + (matchText[txt.match] || '已定位'))
+        : (txt.status === 'loading' ? '载入中…' : (txt.status === 'error' ? '读取失败' : ''));
+    }
+  }
+  lines.classList.add('np-lines-text');
+  lines.style.setProperty('--p-size', state.textSize + 'px');
+  lines.style.setProperty('--p-gap', String(state.textGap));
   if (!state.textOn) { lines.hidden = true; lines.innerHTML = ''; return; }
   lines.hidden = false;
-  if (sub.status === 'loading') {
-    lines.innerHTML = '<div class="np-lines-note">正在载入字幕…</div>';
+  if (txt.status === 'loading') {
+    lines.classList.remove('missing');
+    lines.innerHTML = '<div class="np-lines-note">正在读取本章正文…</div>';
     return;
   }
-  if (sub.status === 'error') {
-    lines.innerHTML = '<div class="np-lines-note">字幕读取失败：' + esc(sub.error) + '</div>';
+  if (txt.status === 'error') {
+    lines.classList.remove('missing');
+    lines.innerHTML = '<div class="np-lines-note">正文读取失败：' + esc(txt.error) + '</div>';
     return;
   }
-  if (!sub.segments.length) {
-    lines.innerHTML = '<div class="np-lines-note">字幕为空或格式无法识别</div>';
-    return;
+  const head = txt.textTitle ? '<div class="np-txt-title">' + esc(txt.textTitle) + '</div>' : '';
+  let body;
+  if (txt.missingBody) {
+    body = '<div class="np-lines-note">' + esc(txt.note || 'txt 中本章正文缺失') + '</div>';
+    lines.classList.add('missing');
+  } else if (!txt.paragraphs.length) {
+    body = '<div class="np-lines-note">' + esc(txt.note || '本章正文为空') + '</div>';
+    lines.classList.add('missing');
+  } else {
+    body = txt.paragraphs.map((item) => '<p class="np-txt-para">' + esc(item) + '</p>').join('');
+    lines.classList.remove('missing');
   }
-  lines.innerHTML = sub.segments.map((seg, i) =>
-    '<button class="np-line" data-act="player-seek" data-index="' + i + '">' +
-    '<span class="np-line-t">' + fmtTime(seg.start) + '</span>' +
-    '<span class="np-line-x">' + esc(seg.text) + '</span></button>').join('');
-  syncPlayerText();
+  lines.innerHTML = head + body;
+}
+
+function adjustTextStyle(kind, delta) {
+  if (kind === 'size') {
+    state.textSize = Math.max(12, Math.min(30, state.textSize + delta));
+    localStorage.setItem('sy_text_size', state.textSize);
+  } else {
+    state.textGap = Math.max(1.3, Math.min(3, Math.round((state.textGap + delta * 0.1) * 10) / 10));
+    localStorage.setItem('sy_text_gap', state.textGap);
+  }
+  const lines = $('p-lines');
+  if (!lines) return;
+  lines.style.setProperty('--p-size', state.textSize + 'px');
+  lines.style.setProperty('--p-gap', String(state.textGap));
 }
 
 function syncPlayerText() {
+  if (!state.current) return;
   const lines = $('p-lines');
   if (!lines || !state.textOn) return;
   const segs = (state.subtitle && state.subtitle.segments) || [];
@@ -1274,12 +1738,35 @@ function syncPlayerText() {
     if (now < Number(segs[i].end || 0) && now >= Number(segs[i].start || 0)) { cur = i; break; }
   }
   const rows = $$('.np-line', lines);
+  $$('.np-w.wcur', lines).forEach((w) => w.classList.remove('wcur'));
+  $$('.np-w.wread', lines).forEach((w) => w.classList.remove('wread'));
   rows.forEach((row, i) => {
     row.classList.toggle('cur', i === cur);
     row.classList.toggle('next', i === cur + 1);
   });
+  /* 有字级时间戳时逐字点亮；已读字降透明度，未读保持正常前景 */
+  if (cur >= 0 && rows[cur] && segs[cur].words && segs[cur].words.length) {
+    const words = segs[cur].words;
+    const spans = $$('.np-w', rows[cur]);
+    let wi = -1;
+    for (let i = 0; i < words.length; i += 1) {
+      const ws = Number(words[i].start || 0);
+      const we = Number(words[i].end || ws);
+      if (now >= ws) wi = i;
+      if (now >= we && spans[i]) spans[i].classList.add('wread');
+      if (now >= ws && now < we) { wi = i; break; }
+    }
+    if (wi >= 0 && spans[wi]) {
+      spans[wi].classList.remove('wread');
+      spans[wi].classList.add('wcur');
+    }
+  }
   if (cur >= 0 && rows[cur]) {
-    const target = rows[cur].offsetTop - lines.clientHeight / 2 + rows[cur].clientHeight / 2;
+    /* 以滚动容器为基准计算目标位置：offsetTop 会受 offsetParent 影响，改用矩形差更稳 */
+    const boxRect = lines.getBoundingClientRect();
+    const rowRect = rows[cur].getBoundingClientRect();
+    const target = lines.scrollTop + (rowRect.top - boxRect.top)
+      - lines.clientHeight / 2 + rows[cur].clientHeight / 2;
     if (Math.abs(lines.scrollTop - target) > rows[cur].clientHeight) {
       lines.scrollTop = Math.max(0, target);
     }
@@ -1402,6 +1889,7 @@ function playEntry(bookId, index, options) {
     syncMini();
     state.playing = true;
     startProgressSaver();
+    startAsr();
     if (route().name === 'player') render();
     else if (route().name === 'book') render();
   }).catch((err) => toast('播放失败：' + err.message));
@@ -1575,6 +2063,7 @@ audio.addEventListener('pause', () => {
   syncPlayerUI();
   syncBgmWithPlayback(false);
   saveProgress(false);
+  stopAsrPrefetch();
 });
 audio.addEventListener('durationchange', syncPlayerUI);
 audio.addEventListener('loadedmetadata', syncPlayerUI);
@@ -1692,6 +2181,7 @@ function viewMine() {
     '<div class="settings-grid"><div class="settings-nav">' +
     '<a data-act="jump" data-target="sec-account" class="active">账号与安全</a>' +
     '<a data-act="jump" data-target="sec-play">播放偏好</a>' +
+    '<a data-act="jump" data-target="sec-asr">AI 字幕（<span id="asr-nav-state">' + engineStateText() + '</span>）</a>' +
     '<a data-act="jump" data-target="sec-bgm">背景音乐</a>' +
     '<a data-act="jump" data-target="sec-library">书库与扫描</a>' +
     '<a data-act="jump" data-target="sec-connect">连接与扫码</a>' +
@@ -1724,6 +2214,12 @@ function viewMine() {
     '<button class="btn btn-ghost btn-sm" data-act="sleep" data-min="' + (state.sleepMin || 0) + '">' + (state.sleepMin ? '修改' : '设置') + '</button></div>' +
     '<div class="form-row"><div><div class="label">清空播放进度</div><div class="hint">只清空当前书籍的续播位置，不影响收藏</div></div>' +
     '<button class="btn btn-ghost btn-sm danger-text" data-act="clear-progress" data-id="' + esc((state.current && state.current.id) || '') + '">清空当前书</button></div>' +
+    '</section>' +
+
+    '<section class="panel" id="sec-asr"><div class="panel-head"><div><h2>AI 字幕（本地转写）</h2>' +
+    '<p>只有正在播放且没有 .srt/.lrc 的章节才会排队转写；独立进程运行、边转边写入字幕，不阻塞播放。</p></div>' +
+    '<span class="asr-state-pill ' + state.engine.state + '" id="asr-head-pill">' + engineStateText() + '</span></div>' +
+    '<div id="asr-panel-body">' + enginePanelBody() + '</div>' +
     '</section>' +
 
     '<section class="panel" id="sec-bgm"><div class="accordion" style="border-top:none;padding-top:0">' +
@@ -1787,10 +2283,13 @@ function ensureMineData() {
     loadUsers().catch(() => {}),
     loadBgm().catch(() => {}),
     loadPlaylists().catch(() => {}),
+    loadEngine().catch(() => {}),
+    (state.engine.checksLoaded ? Promise.resolve() : loadEngineChecks().catch(() => {})),
   ]).then(() => {
     mineFetchedAt = Date.now();
     mineFetching = false;
     if (route().name === 'mine') { $('view').innerHTML = viewMine(); }
+    if (engineBusy()) ensureEnginePoll();
   }).catch(() => { mineFetching = false; });
 }
 
@@ -2475,11 +2974,15 @@ const ACTIONS = {
   'root-add': addRoot,
   'root-del': (el) => removeRoot(Number(el.dataset.index)),
   'player-text': () => {
+    if (!$('p-text')) { toast('本书目录下没有可展示的文本'); return; }
     state.textOn = !state.textOn;
     localStorage.setItem('sy_text', state.textOn ? '1' : '0');
+    $$('.np-util[data-act="player-text"]').forEach((btn) => btn.classList.toggle('on', state.textOn));
     paintPlayerText();
-    if (state.textOn) syncPlayerText();
+    if (state.textOn) { ensureSubtitle(); syncPlayerText(); }
   },
+  'text-size': (el) => adjustTextStyle('size', Number(el.dataset.delta)),
+  'text-gap': (el) => adjustTextStyle('gap', Number(el.dataset.delta)),
   'player-seek': (el) => {
     const seg = (state.subtitle.segments || [])[Number(el.dataset.index)];
     if (!seg) return;
@@ -2505,6 +3008,22 @@ const ACTIONS = {
   'connect': openConnect,
   'clear-progress': (el) => clearProgress(el.dataset.id),
   'logout': logout,
+  'asr-install': () => startEngineInstall(),
+  'asr-cancel': () => cancelEngineInstall(),
+  'asr-model': (el) => changeEngineModel(el.dataset.model),
+  'asr-recheck': () => {
+    loadEngineChecks(true)
+      .then(() => { refreshEnginePanel(); toast('环境检测完成'); })
+      .catch((err) => toast(err.message || '检测失败'));
+  },
+  'goto-asr-install': () => {
+    go('#/mine');
+    setTimeout(() => {
+      const target = $('sec-asr');
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      $$('.settings-nav a').forEach((a) => a.classList.toggle('active', a.dataset.target === 'sec-asr'));
+    }, 160);
+  },
   'jump': (el) => {
     const target = $(el.dataset.target);
     if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
