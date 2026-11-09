@@ -53,10 +53,22 @@ check_process() {
     kill -0 "$1" 2>/dev/null
 }
 
+# 进程是否还存在：kill -0 对非本用户的进程会返回 EPERM（误判为不存在），
+# 这里改用 /proc/<pid> 判断存活，避免把 root 启动的同名实例当成"没在跑"。
+proc_exists() {
+    [ -n "$1" ] && [ -d "/proc/$1" ]
+}
+
+# 是否是本应用的 server.py（按命令行判断，不看属主）
+proc_is_ours() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "${SERVER_DIR}/server.py"
+}
+
 status() {
     if [ -f "${PID_FILE}" ]; then
         pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
-        if check_process "${pid}"; then
+        if proc_exists "${pid}"; then
             return 0
         fi
         rm -f "${PID_FILE}"
@@ -68,7 +80,7 @@ status() {
     # 且 comm 是 python 解释器的 pid。
     for p in $(pgrep -f "${SERVER_DIR}/server.py" 2>/dev/null); do
         [ -n "$p" ] || continue
-        check_process "$p" || continue
+        proc_exists "$p" || continue
         comm=$(cat "/proc/$p/comm" 2>/dev/null)
         case "$comm" in
             sudo|env|nohup|setsid|bash|sh) continue ;;
@@ -76,7 +88,7 @@ status() {
         pid="$p"
         break
     done
-    if [ -n "$pid" ] && check_process "$pid"; then
+    if proc_exists "$pid"; then
         printf "%s" "$pid" > "${PID_FILE}" 2>/dev/null || true
         return 0
     fi
@@ -96,12 +108,40 @@ start_process() {
         return 0
     fi
 
-    # 端口已被其他进程监听、但 status 又找不到本应用的托管进程：说明是上一个
-    # 手动/残留实例还占着端口。此时再拉起只会等 30-60 秒后 bind 失败（应用中心
-    # 先记启动成功、再记 APP_CRASH），这里直接给出明确原因。
+    # 端口已被监听、但 status 又找不到本应用托管的进程：分两种情况处理。
+    # a) 占用者仍是本应用的 server.py（例如旧实例正在优雅退出、或由 root 启动
+    #    导致应用用户 kill -0 失败）→ 等它退出，最多 45 秒，别一上来就报错。
+    # b) 占用者与本应用无关 → 立即失败并给出明确原因，不浪费时间。
     if port_listening; then
-        log_msg "启动失败：端口 ${PORT} 已被其他进程占用（不是本应用托管的实例），请先停止占用进程后重试。"
-        return 1
+        local ours=0 waiter=0
+        for p in $(pgrep -f "server.py" 2>/dev/null); do
+            if proc_is_ours "$p"; then
+                ours=1
+                break
+            fi
+        done
+        if [ "$ours" = "1" ]; then
+            log_msg "端口 ${PORT} 被本应用旧实例占用，等待其退出（最多 45 秒）..."
+            while [ "$waiter" -lt 45 ]; do
+                sleep 1
+                waiter=$((waiter + 1))
+                if ! port_listening; then
+                    log_msg "旧实例已退出（等待 ${waiter}s），继续启动"
+                    break
+                fi
+                if status; then
+                    log_msg "本应用实例已在运行（等待 ${waiter}s），跳过重复启动"
+                    return 0
+                fi
+            done
+            if port_listening; then
+                log_msg "启动失败：端口 ${PORT} 仍被本应用旧实例占用，等待 45 秒超时。请先在应用中心停止该应用后重试。"
+                return 1
+            fi
+        else
+            log_msg "启动失败：端口 ${PORT} 已被其他进程占用（不是本应用），请先停止占用进程后重试。"
+            return 1
+        fi
     fi
 
     rm -f "$GATEWAY_SOCKET" 2>/dev/null || true
