@@ -160,9 +160,18 @@ function progressOf(book) {
 
 function api(path, options) {
   const opts = Object.assign({}, options || {});
+  const timeoutMs = Number(opts.timeoutMs || 0);
+  delete opts.timeoutMs;
   opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
   if (state.token) opts.headers.Authorization = 'Bearer ' + state.token;
-  return fetch(appUrl(path), opts).then((res) => res.json().then((data) => {
+  let timer = null;
+  if (timeoutMs > 0 && typeof AbortController !== 'undefined') {
+    const controller = new AbortController();
+    opts.signal = controller.signal;
+    timer = setTimeout(() => controller.abort(), timeoutMs);
+  }
+  const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
+  const request = fetch(appUrl(path), opts).then((res) => res.json().then((data) => {
     if (res.status === 401 && path.indexOf('/api/auth/login') < 0) {
       onUnauthorized();
       throw new Error('登录已过期');
@@ -170,6 +179,7 @@ function api(path, options) {
     if (!res.ok) throw new Error((data && data.error) || ('请求失败 ' + res.status));
     return data;
   }));
+  return request.then((value) => { clear(); return value; }, (err) => { clear(); throw err; });
 }
 
 function bookById(id) {
@@ -278,7 +288,8 @@ function paintUser() {
 /* ------------------------------------------------------------------ 数据加载 */
 
 function loadLibrary() {
-  return api('/api/library').then((data) => {
+  /* 25 秒超时：FUSE 挂死时页面不再无限转圈，改为提示并继续轮询扫描状态 */
+  return api('/api/library', { timeoutMs: 25000 }).then((data) => {
     state.books = data.books || [];
     state.bookMap = {};
     state.books.forEach((b) => { state.bookMap[b.id] = b; });
@@ -322,6 +333,11 @@ function loadBgm() {
   return api('/api/bgm/list').then((data) => {
     state.bgm.dir = data.dir || state.bgm.dir;
     state.bgm.list = data.bgm || [];
+    /* 当前曲目已被删除/移走时清掉记忆，避免点"选用"落到一个不存在的地址 */
+    if (state.bgm.current && !state.bgm.list.some((t) => t.url === state.bgm.current)) {
+      state.bgm.current = '';
+      localStorage.removeItem('sy_bgm_current');
+    }
     if (!state.bgm.current && state.bgm.list.length) {
       state.bgm.current = state.bgm.list[0].url;
     }
@@ -372,6 +388,13 @@ function startScanWatch() {
       syncScanNote();
       if (was && !state.scanning) {
         loadLibrary().then(() => { render(); toast('书库已更新'); });
+      } else if (!state.scanning && !state.books.length) {
+        /* 首屏加载超时/失败后的补偿：每 30 秒重试一次，避免无限转圈 */
+        const now = Date.now();
+        if (!state.libraryRetryAt || now - state.libraryRetryAt > 30000) {
+          state.libraryRetryAt = now;
+          loadLibrary().then(() => render()).catch(() => {});
+        }
       }
     }).catch(() => {});
   }, 3000);
@@ -1875,6 +1898,8 @@ function openTrackDrawer() {
     '<div class="list-thumb" style="--c1:#b08a3e;--c2:#6d5323">音</div>' +
     '<div class="grow"><div class="name">' + esc(t.title) + '</div>' +
     '<div class="sub">' + (t.from === 'folder' ? '目录曲目' : '上传曲目') + ' · ' + fmtSize(t.size) + '</div></div>' +
+    (t.from === 'folder' ? '' :
+      '<button class="btn btn-ghost btn-sm" data-act="bgm-del" data-url="' + esc(t.url) + '">删除</button>') +
     (t.url === state.bgm.current ? '<span class="tail">当前</span>' : '<span class="tail">选用</span>') + '</div>'
   ).join('');
   openDrawer('<h3>背景音乐曲目</h3>' +
@@ -1891,6 +1916,28 @@ function pickBgmTrack(url) {
   toast('已选用：' + bgmTrackTitle(url));
   openTrackDrawer();
   if (route().name === 'mine') $('view').innerHTML = viewMine();
+}
+
+/* 删除应用内上传/内置的曲目；目录曲目属于用户媒体库，不在这里删 */
+function deleteBgmTrack(url) {
+  const raw = String(url || '');
+  if (!raw || raw.indexOf('/bgm/file?') === 0 || raw.indexOf('/bgm/') !== 0) return;
+  let name = '';
+  try { name = decodeURIComponent(raw.slice('/bgm/'.length)); } catch (e) { name = ''; }
+  if (!name || name.indexOf('/') >= 0) return;
+  if (!window.confirm('删除「' + name + '」？该文件会从应用数据目录移除，之后不再出现在列表里。')) return;
+  api('/api/bgm/' + encodeURIComponent(name), { method: 'DELETE' }).then(() => {
+    if (state.bgm.current === raw) {
+      state.bgm.current = '';
+      localStorage.removeItem('sy_bgm_current');
+    }
+    return loadBgm();
+  }).then(() => {
+    toast('已删除：' + name);
+    if (state.bgm.enabled) bgmApply(state.playing);
+    openTrackDrawer();
+    if (route().name === 'mine') $('view').innerHTML = viewMine();
+  }).catch((err) => toast(err.message));
 }
 
 /* ------------------------------------------------------------------ 书单操作 */
@@ -2388,6 +2435,7 @@ const ACTIONS = {
   'bgm-use': (el) => bgmUseDir(el.dataset.path),
   'bgm-tracks': openTrackDrawer,
   'bgm-use-track': (el) => pickBgmTrack(el.dataset.url),
+  'bgm-del': (el) => deleteBgmTrack(el.dataset.url),
   'bgm-refresh': () => loadBgm().then(() => { toast('曲目已刷新'); openTrackDrawer(); }),
   'bgm-rand': bgmRandomTrack,
   'pl-create': createPlaylist,
@@ -2575,7 +2623,13 @@ function startApp() {
       const el = $('about-version');
       if (el) el.textContent = 'v' + (d.version || '—');
     }).catch(() => {});
-  }).catch((err) => toast('书库加载失败：' + err.message));
+  }).catch((err) => {
+    const timedOut = err && (err.name === 'AbortError' ||
+      /aborted|abort|超时/i.test(String(err.message || '')));
+    toast(timedOut ? '书库加载超时，继续查询扫描状态…' : '书库加载失败：' + err.message, 4000);
+    /* 不要停在转圈：继续用 /api/scan/status 轮询，扫描结束/可访问后再拉书库 */
+    startScanWatch();
+  });
   loadPlaylists();
   loadSettings().catch(() => {});
   loadBgm().then(() => bgmApply(false)).catch(() => {});

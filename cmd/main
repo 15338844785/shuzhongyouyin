@@ -1,0 +1,217 @@
+#!/bin/bash
+
+LOG_FILE="${TRIM_TEMP_LOGFILE}"
+DATA_DIR="${TRIM_PKGVAR:-${TRIM_APPDEST}/var}"
+SERVER_DIR="${TRIM_APPDEST}/server"
+SEED_DIR="${SERVER_DIR}/preinstalled-bgm"
+PID_FILE="${DATA_DIR}/app.pid"
+GATEWAY_SOCKET="${TRIM_APPDEST}/shuzhongyouyin.sock"
+
+PORT="${wizard_port:-${TRIM_SERVICE_PORT:-8098}}"
+export TRIM_SERVICE_PORT="$PORT"
+export TRIM_PKGVAR="$DATA_DIR"
+export FNPATH_DATA_DIR="$DATA_DIR"
+
+mkdir -p "$DATA_DIR" 2>/dev/null || true
+
+log_msg() {
+    if [ -n "$LOG_FILE" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "${LOG_FILE}"
+    fi
+}
+
+seed_bgm() {
+    [ -d "$SEED_DIR" ] || return 0
+    local marker="$DATA_DIR/.bgm_seeded"
+    # 只在首次安装时播种一次：用户删掉内置曲目后，重启/升级不能再把它塞回来
+    if [ -f "$marker" ]; then
+        return 0
+    fi
+    mkdir -p "$DATA_DIR/bgm" 2>/dev/null || true
+    local f name existing=0
+    for f in "$DATA_DIR/bgm"/*; do
+        if [ -f "$f" ]; then
+            existing=1
+            break
+        fi
+    done
+    if [ "$existing" = "1" ]; then
+        : > "$marker" 2>/dev/null || true
+        return 0
+    fi
+    for f in "$SEED_DIR"/*; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        [ "$name" = "README.txt" ] && continue
+        cp -f "$f" "$DATA_DIR/bgm/$name" 2>/dev/null || true
+    done
+    : > "$marker" 2>/dev/null || true
+    log_msg "Seeded preinstalled BGM to $DATA_DIR/bgm"
+}
+
+check_process() {
+    kill -0 "$1" 2>/dev/null
+}
+
+status() {
+    if [ -f "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        if check_process "${pid}"; then
+            return 0
+        fi
+        rm -f "${PID_FILE}"
+    fi
+    # 兼容平台直接拉起或 pid 文件丢失：按命令行找回进程并补写 pid 文件。
+    # 注意：pgrep -f 可能先匹配到 sudo/env 这类包装进程（root 所有，应用用户
+    # kill -0 会返回 Operation not permitted），若取到它就会误判「未运行」，
+    # 进而又拉起一个实例去抢已被占用的端口。这里逐个挑选本用户能检查、
+    # 且 comm 是 python 解释器的 pid。
+    for p in $(pgrep -f "${SERVER_DIR}/server.py" 2>/dev/null); do
+        [ -n "$p" ] || continue
+        check_process "$p" || continue
+        comm=$(cat "/proc/$p/comm" 2>/dev/null)
+        case "$comm" in
+            sudo|env|nohup|setsid|bash|sh) continue ;;
+        esac
+        pid="$p"
+        break
+    done
+    if [ -n "$pid" ] && check_process "$pid"; then
+        printf "%s" "$pid" > "${PID_FILE}" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+port_listening() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | grep -qE "[:.]${PORT}$"
+        return $?
+    fi
+    netstat -lnt 2>/dev/null | awk 'NR>2 {print $4}' | grep -qE "[:.]${PORT}$"
+}
+
+start_process() {
+    if status; then
+        return 0
+    fi
+
+    # 端口已被其他进程监听、但 status 又找不到本应用的托管进程：说明是上一个
+    # 手动/残留实例还占着端口。此时再拉起只会等 30-60 秒后 bind 失败（应用中心
+    # 先记启动成功、再记 APP_CRASH），这里直接给出明确原因。
+    if port_listening; then
+        log_msg "启动失败：端口 ${PORT} 已被其他进程占用（不是本应用托管的实例），请先停止占用进程后重试。"
+        return 1
+    fi
+
+    rm -f "$GATEWAY_SOCKET" 2>/dev/null || true
+    seed_bgm
+
+    log_msg "Starting 书中有音 ..."
+    log_msg "DATA_DIR: $DATA_DIR"
+    log_msg "SERVER_DIR: $SERVER_DIR"
+    log_msg "PORT: $PORT"
+
+    # 目录缺失时明确报出来，别只留一句笼统的 Failed to start
+    if [ ! -d "$SERVER_DIR" ]; then
+        log_msg "SERVER_DIR not found: $SERVER_DIR"
+        return 1
+    fi
+    if [ ! -r "$SERVER_DIR/server.py" ]; then
+        log_msg "server.py not readable: $SERVER_DIR/server.py"
+        return 1
+    fi
+
+    # Python 运行时检查：优先 PATH 中的 python3，回退 /usr/bin/python3；最低 3.8
+    PY_BIN=$(command -v python3 2>/dev/null)
+    if [ -z "$PY_BIN" ]; then
+        PY_BIN="/usr/bin/python3"
+    fi
+    if [ ! -x "$PY_BIN" ]; then
+        log_msg "启动失败：未找到 Python 3。「书中有音」需要 Python 3.8 及以上；请确认系统自带 python3，或在应用中心安装 Python 后重启应用。"
+        return 1
+    fi
+    PY_VER=$("$PY_BIN" -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null)
+    if ! "$PY_BIN" -c 'import sys;raise SystemExit(0 if sys.version_info>=(3,8) else 1)' 2>/dev/null; then
+        log_msg "启动失败：当前 Python 版本为 ${PY_VER:-未知}，低于最低要求 3.8。「书中有音」需要 Python 3.8 及以上，请升级 Python 后重启应用。"
+        return 1
+    fi
+    log_msg "Python: ${PY_VER:-unknown} (${PY_BIN})"
+
+    (
+        cd "$SERVER_DIR" || exit 1
+        "$PY_BIN" "$SERVER_DIR/server.py" --port "$PORT" >> "${LOG_FILE:-/dev/null}" 2>&1 &
+        printf "%s" "$!" > "${PID_FILE}"
+    ) || {
+        log_msg "Failed to start process from $SERVER_DIR"
+        return 1
+    }
+
+    # 启动确认不能只看 6 秒进程存活：大库加载 library.json 需要数十秒，之后才
+    # bind 端口；bind 失败（端口冲突等）在加载完成前不会暴露，容易被误判成
+    # 「启动成功」，应用中心随后才记 APP_CRASH。这里等到端口真正监听为止。
+    local pid count=0
+    pid=$(head -n 1 "${PID_FILE}" 2>/dev/null | tr -d '[:space:]')
+    while [ "$count" -lt 60 ]; do
+        sleep 1
+        count=$((count + 1))
+        if [ -z "$pid" ] || ! check_process "$pid"; then
+            log_msg "server.py exited during startup (port $PORT), see log above"
+            rm -f "$PID_FILE"
+            return 1
+        fi
+        if port_listening; then
+            log_msg "server.py listening on port $PORT (after ${count}s)"
+            return 0
+        fi
+    done
+
+    log_msg "server.py did not listen on port $PORT within 60s, see log above"
+    return 1
+}
+
+stop_process() {
+    log_msg "Stopping process ..."
+    rm -f "$GATEWAY_SOCKET" 2>/dev/null || true
+
+    if [ -r "${PID_FILE}" ]; then
+        pid=$(head -n 1 "${PID_FILE}" | tr -d '[:space:]')
+        log_msg "pid=${pid}"
+        if check_process "${pid}"; then
+            log_msg "send TERM signal to PID:${pid} ..."
+            kill -TERM "${pid}" > /dev/null 2>&1
+            local count=0
+            while check_process "${pid}" && [ $count -lt 10 ]; do
+                sleep 1
+                count=$((count + 1))
+            done
+            if check_process "${pid}"; then
+                log_msg "send KILL signal to PID:${pid} ..."
+                kill -KILL "${pid}" > /dev/null 2>&1
+            fi
+        fi
+        rm -f "${PID_FILE}"
+    fi
+
+    rm -f "$GATEWAY_SOCKET" 2>/dev/null || true
+    return 0
+}
+
+case $1 in
+start)
+    start_process
+    ;;
+stop)
+    stop_process
+    ;;
+status)
+    if status; then
+        exit 0
+    else
+        exit 3
+    fi
+    ;;
+*)
+    exit 1
+    ;;
+esac

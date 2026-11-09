@@ -34,7 +34,6 @@ AUDIO_EXTS = {
 }
 
 COVER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-COVER_MAX_BYTES = 8 * 1024 * 1024  # 单张封面最大 8MB
 
 BGM_EXTS = set(AUDIO_EXTS)  # 背景音乐与书库共用同一份音频扩展名白名单
 MAX_BGM_BYTES = 80 * 1024 * 1024  # 80MB
@@ -1400,12 +1399,9 @@ def normalize_cover_url(value):
     value = value.strip()
     if value.startswith("//"):
         return "https:" + value
-    if value.lower().startswith(("http://", "https://")):
-        return value
     if value.startswith("/"):
         return DEFAULT_SCRAPE_BASE.rstrip("/") + value
-    # 喜马拉雅搜索返回的是相对路径（如 group37/M0A/...jpg），拼到图片 CDN
-    return "https://imagev2.xmcdn.com/" + value.lstrip("/")
+    return value
 
 
 def image_host_allowed(url, extra_base=""):
@@ -2032,7 +2028,7 @@ def friendly_net_error(text):
     return text
 
 
-def download_image(url, dest, max_bytes=COVER_MAX_BYTES):
+def download_image(url, dest):
     """下载封面到本地，返回 (真实路径, 错误)"""
     target = urllib.parse.urlparse(url).netloc.lower()
     if "lrts" in target:
@@ -2043,20 +2039,13 @@ def download_image(url, dest, max_bytes=COVER_MAX_BYTES):
         referer = DEFAULT_SCRAPE_BASE + "/"
     req = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA, "Referer": referer})
     try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = resp.read()
             ctype = (resp.headers.get("Content-Type") or "").lower()
-            length = (resp.headers.get("Content-Length") or "").strip()
-            if length.isdigit() and int(length) > max_bytes:
-                return None, "封面超过大小限制（%d MB）" % (max_bytes // (1024 * 1024))
-            body = resp.read(max_bytes + 1)
     except Exception as exc:
         return None, "封面下载失败: %s" % exc
-    if len(body) > max_bytes:
-        return None, "封面超过大小限制（%d MB）" % (max_bytes // (1024 * 1024))
     if not body:
         return None, "封面内容为空"
-    if not ctype.startswith("image/"):
-        return None, "返回内容类型不是图片: %s" % (ctype or "未知")
     ext = ".jpg"
     if "png" in ctype:
         ext = ".png"
@@ -2481,6 +2470,14 @@ class AppState(object):
             "roots": self.roots,
             "scanned_at": self.scanned_at,
         })
+
+    def save_library_data(self, books, roots, scanned_at):
+        """在锁外序列化书库（271MB 级），返回临时文件路径；调用方只需短暂加锁做 os.replace"""
+        tmp = self.library_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fp:
+            json.dump({"books": books, "roots": roots, "scanned_at": scanned_at},
+                      fp, ensure_ascii=False, indent=2)
+        return tmp
 
     def save_progress(self):
         save_json(self.progress_path, self.progress)
@@ -3079,54 +3076,29 @@ class AppState(object):
         path = self.scraped_cover(book["id"])
         if path:
             return path
-        path = book.get("_cover_abs")
-        return path if path and os.path.isfile(path) else None
+        # _cover_abs 是扫描时 find_cover 已确认存在的路径；首屏接口不再实时
+        # os.path.isfile/getmtime，避免在 rclone FUSE 挂载上做同步 stat（可能挂起）
+        return book.get("_cover_abs") or None
 
     def cover_url(self, book):
         path = self.cover_info(book)
         if not path:
             return None
-        try:
-            version = int(os.path.getmtime(path) * 1000)
-        except OSError:
-            return None
+        if path == book.get("_cover_abs"):
+            # FUSE 封面：版本号用扫描时记录的书籍 mtime，不访问挂载点
+            version = int(book.get("mtime") or 0)
+        else:
+            try:
+                version = int(os.path.getmtime(path))
+            except OSError:
+                return None
         return "/cover-img/%s?v=%d" % (book["id"], version)
-
-    def cover_version(self, book):
-        """封面版本号（毫秒级 mtime），用于兼容接口的缓存失效"""
-        path = self.cover_info(book)
-        if not path:
-            return 0
-        try:
-            return int(os.path.getmtime(path) * 1000)
-        except OSError:
-            return 0
 
     def scrape_config(self):
         config = self.settings.get("scrape") or {}
         return {
             "api_base": (config.get("api_base") or DEFAULT_SCRAPE_BASE).strip(),
         }
-
-    def save_scraped_cover(self, book_id, url):
-        """下载并保存刮削封面，返回 (路径, 错误)"""
-        url = normalize_cover_url(str(url or "").strip())
-        if not url:
-            return None, "未提供封面地址"
-        if not url.lower().startswith(("http://", "https://")):
-            return None, "封面地址无效: %s" % url
-        target = os.path.join(self.cover_dir, book_id + ".jpg")
-        path, error = download_image(url, target, COVER_MAX_BYTES)
-        if error:
-            return None, friendly_net_error(error)
-        for ext in COVER_EXTS:
-            other = os.path.join(self.cover_dir, book_id + ext)
-            if other != path and os.path.isfile(other):
-                try:
-                    os.remove(other)
-                except OSError:
-                    pass
-        return path, None
 
     def cover_is_manual(self, book):
         """判断封面是否由用户手动/本地提供：这类封面不允许被刮削自动覆盖"""
@@ -3138,7 +3110,7 @@ class AppState(object):
         return bool(book.get("_cover_abs")) and not self.scraped_cover(book["id"])
 
     def apply_scraped_cover(self, book, url):
-        """应用刮削封面；失败只记录原因，不影响字段与章节更新"""
+        """应用刮削封面；返回三态结果（updated / skipped_manual / failed）"""
         result = {"status": "not_found", "error": None, "url": url or ""}
         if not str(url or "").strip():
             return result
@@ -3154,6 +3126,21 @@ class AppState(object):
         result["status"] = "updated"
         result["path"] = path
         return result
+
+    def save_scraped_cover(self, book_id, url):
+        """下载并保存刮削封面，返回 (路径, 错误)"""
+        target = os.path.join(self.cover_dir, book_id + ".jpg")
+        path, error = download_image(url, target)
+        if error:
+            return None, friendly_net_error(error)
+        for ext in COVER_EXTS:
+            other = os.path.join(self.cover_dir, book_id + ext)
+            if other != path and os.path.isfile(other):
+                try:
+                    os.remove(other)
+                except OSError:
+                    pass
+        return path, None
 
     def apply_metadata(self, book_id, values):
         """保存刮削与播放偏好字段"""
@@ -3613,7 +3600,7 @@ class AppState(object):
             "title": self.display_title(book),
             "author": meta.get("author") or None,
             "narrator": meta.get("narrator") or None,
-            "cover_url": "/api/cover/%s.jpg?v=%d" % (book["id"], self.cover_version(book)),
+            "cover_url": "/api/cover/%s.jpg" % book["id"],
             "theme_color": meta.get("theme_color") or None,
             "description": meta.get("description") or None,
             "skip_intro": self.meta_seconds(meta, "skip_intro"),
@@ -3684,7 +3671,7 @@ class AppState(object):
                 "user_id": "local",
                 "book_id": book_id,
                 "book_title": self.display_title(book),
-                "cover_url": "/api/cover/%s.jpg?v=%d" % (book_id, self.cover_version(book)),
+                "cover_url": "/api/cover/%s.jpg" % book_id,
                 "chapter_id": "%s_%d" % (book_id, index),
                 "chapter_title": chapter.get("title") or strip_ext(chapter.get("file_name", "")),
                 "chapter_duration": float((entry.get("durations") or {}).get(str(index)) or 0),
@@ -3803,16 +3790,20 @@ class AppState(object):
             report["duplicates"] = len(duplicates)
             books.sort(key=lambda b: natural_key(b["title"]))
             old_books = {book["id"]: book for book in self.books}
+            scanned_at = int(time.time())
+            # 标题覆盖只改本次构建的 books；进度迁移涉及共享 progress，短锁完成
+            self.apply_chapter_overrides(books)
             with self.lock:
                 self.scan_report = report
                 progress_changed = self._adopt_scan_progress(old_books, books, duplicates)
-                # 章节与书单一次性原子写库（单次 save_library 即批事务）
-                self.apply_chapter_overrides(books)
+            # 271MB 序列化放锁外，避免整库写盘期间所有加锁接口被拖住
+            tmp_library = self.save_library_data(books, roots, scanned_at)
+            with self.lock:
                 self.books = books
                 self.books_by_id = {book["id"]: book for book in books}
                 self.roots = roots
-                self.scanned_at = int(time.time())
-                self.save_library()
+                self.scanned_at = scanned_at
+                os.replace(tmp_library, self.library_path)
                 if progress_changed:
                     self.save_progress()
                 if self._meta_dirty:
@@ -4777,31 +4768,42 @@ class Handler(BaseHTTPRequestHandler):
     def handle_library(self, query):
         if query.get("refresh"):
             STATE.start_scan()
+        # 只做一次短暂的加锁快照；书籍 payload 的构建放到锁外，
+        # 这样单个请求里哪怕 FUSE 卡死，也不会把其它加锁接口一起拖住。
         with STATE.lock:
-            books = [book_api(STATE, book) for book in STATE.books]
-            books.sort(key=lambda b: natural_key(b["title"]))
+            snapshot = list(STATE.books)
+            roots = list(STATE.roots)
+            scanned_at = STATE.scanned_at
+            progress_view = dict(STATE.progress)
+            platform = STATE.platform_summary()
+            scanner = self.scan_snapshot()
+        books = [book_api(STATE, book) for book in snapshot]
+        books.sort(key=lambda b: natural_key(b["title"]))
         # 书库列表不返回章节明细：有声书章节动辄上千条，全量下发会让
         # 飞牛中继（nginx 代理）因响应过大/超时而加载失败。
         # 客户端打开书籍详情时再按需请求 /api/book/<id>。
         if not query.get("full"):
             for item in books:
                 item.pop("chapters", None)
+        scanned_roots = scanner.get("roots_scanned") or []
+        skipped_roots = scanner.get("roots_skipped") or []
         root_info = []
-        for root in STATE.roots:
-            count = sum(1 for book in STATE.books if book.get("root") == root)
+        for root in roots:
+            count = sum(1 for book in snapshot if book.get("root") == root)
             root_info.append({
                 "path": root,
-                "exists": os.path.isdir(root),
+                # 首屏不访问 FUSE：命中扫描/跳过名单即视为存在
+                "exists": root in scanned_roots or root in skipped_roots,
                 "books": count,
             })
         self.send_json({
             "ok": True,
             "books": books,
             "roots": root_info,
-            "scanned_at": STATE.scanned_at,
-            "progress": STATE.progress,
-            "platform": STATE.platform_summary(),
-            **self.scan_snapshot(),
+            "scanned_at": scanned_at,
+            "progress": progress_view,
+            "platform": platform,
+            **scanner,
         })
 
     def handle_book(self, book_id):
@@ -4948,6 +4950,7 @@ class Handler(BaseHTTPRequestHandler):
             "cover": cover_result,
             "cover_error": cover_result.get("error"),
             "book": STATE.book_payload(book),
+            "chapters": None,
         })
 
     def handle_image_proxy(self, query):
@@ -5949,7 +5952,7 @@ class DualStackServer(Server):
         Server.server_bind(self)
 
 
-APP_VERSION = "1.6.2"
+APP_VERSION = "1.6.5"
 # 实际监听端口（main() 启动时更新，供 /api/network 生成地址使用）
 LISTEN_PORT = int(os.environ.get("TRIM_SERVICE_PORT") or 8098)
 
@@ -5980,7 +5983,8 @@ def main():
         pass
 
     print("书中有音 server listening on %s:%d, data=%s" % (bind_desc, args.port, STATE.data_dir), flush=True)
-    if not STATE.books or STATE.settings.get("bgm_dir"):
+    # 运维用：设置 SZY_NO_AUTOSCAN=1 可在启动时跳过自动扫描（默认行为不变）
+    if not os.environ.get("SZY_NO_AUTOSCAN") and (not STATE.books or STATE.settings.get("bgm_dir")):
         STATE.start_scan()
     try:
         httpd.serve_forever(poll_interval=0.5)
